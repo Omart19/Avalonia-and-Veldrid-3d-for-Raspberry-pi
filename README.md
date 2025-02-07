@@ -38,7 +38,7 @@ This error is common with Veldrid, even outside of this specific project. To res
 4.  **Build the native library:** Build the library for your platform (Linux x64 in this case).  You do *not* need to modify the build script, despite what might be mentioned in other instructions.
 
     ```bash
-    ./build-native.sh -release linux-x64
+    ./build-native.sh -release linux-arm64
     ```
 
 5.  **Copy the library file:**  Copy the resulting `.so` file to the appropriate .NET shared framework directory.  Replace `9.0.0` with the *exact* .NET version your project is using.  You can find this version by looking at your project's `.csproj` file (look for `<TargetFramework>net9.0</TargetFramework>` or similar, use the version number there, eg: 6.0.25, 7.0.14, 8.0.2). Use the correct path for the shared folder of the correct dotnet version!
