@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Markup.Xaml;
 using Avalonia.Threading;
+using Avalonia.Input; 
 using System;
 using System.IO;
 using System.Numerics;
@@ -59,6 +60,16 @@ namespace VeldridSTLViewer
         private bool _resourcesCreated = false;
         private int _renderCount = 0; // Counter for Render calls
 
+        private bool _mouseDown;
+        private Vector2 _previousMousePosition;
+        private float _cameraYaw = 0f;
+        private float _cameraPitch = 0f;
+        private Vector3 _cameraPosition = new Vector3(0, 0, 5);
+        private DeviceBuffer _gridVertexBuffer;
+        private DeviceBuffer _gridIndexBuffer;
+        private Shader[] _gridShaders;
+        private Pipeline _gridPipeline;
+
         // Simplified shaders
         private const string VertexCode = @"
         #version 450
@@ -93,6 +104,11 @@ namespace VeldridSTLViewer
         {
             this.AttachedToVisualTree += OnAttachedToVisualTree;
             this.DetachedFromVisualTree += OnDetachedFromVisualTree;
+
+            // Subscribe to pointer events
+            this.PointerPressed += OnPointerPressed;
+            this.PointerMoved += OnPointerMoved;
+            this.PointerReleased += OnPointerReleased;
         }
 
         private void OnAttachedToVisualTree(object sender, VisualTreeAttachmentEventArgs e)
@@ -121,6 +137,7 @@ namespace VeldridSTLViewer
 
                 _graphicsDevice = GraphicsDevice.CreateVulkan(options); // Stick with Vulkan
                 CreateResources();
+                CreateGridResources();
 
             }
             catch (Exception ex)
@@ -138,6 +155,133 @@ namespace VeldridSTLViewer
                 ResizeResources();
             }
         }
+
+        private void CreateGridResources()
+        {
+            // Generate grid vertices and indices
+            var (gridVertices, gridIndices) = GenerateGrid(10, 1, new Vector2(10, 10));
+        
+            // Create grid vertex buffer
+            _gridVertexBuffer = _graphicsDevice.ResourceFactory.CreateBuffer(new BufferDescription((uint)(gridVertices.Length * VertexPositionColor.SizeInBytes), BufferUsage.VertexBuffer));
+            _graphicsDevice.UpdateBuffer(_gridVertexBuffer, 0, gridVertices);
+        
+            // Create grid index buffer
+            _gridIndexBuffer = _graphicsDevice.ResourceFactory.CreateBuffer(new BufferDescription((uint)(gridIndices.Length * sizeof(ushort)), BufferUsage.IndexBuffer));
+            _graphicsDevice.UpdateBuffer(_gridIndexBuffer, 0, gridIndices);
+        
+            // Create grid shaders
+            var gridVertexShaderDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(GridVertexCode), "main");
+            var gridFragmentShaderDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(GridFragmentCode), "main");
+            _gridShaders = _graphicsDevice.ResourceFactory.CreateFromSpirv(gridVertexShaderDesc, gridFragmentShaderDesc);
+        
+            // Create grid pipeline
+            var gridPipelineDescription = new GraphicsPipelineDescription(
+                BlendStateDescription.SingleOverrideBlend,
+                new RasterizerStateDescription(
+                    cullMode: FaceCullMode.None,
+                    fillMode: PolygonFillMode.Solid,
+                    frontFace: FrontFace.Clockwise,
+                    depthClipEnabled: true,
+                    scissorTestEnabled: false),
+                PrimitiveTopology.LineList,
+                Array.Empty<ResourceLayout>(),
+                new ShaderSetDescription(
+                    new VertexLayoutDescription {
+                        new VertexLayoutDescription( // Corrected nesting
+                            new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                            new VertexElementDescription("Color", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float4))
+                    },
+                    _gridShaders),
+                _offscreenFramebuffer.OutputDescription
+            );
+            _gridPipeline = _graphicsDevice.ResourceFactory.CreateGraphicsPipeline(gridPipelineDescription);
+        }
+
+        private (VertexPositionColor, ushort) GenerateGrid(int numCells, float lineWidth, Vector2 size)
+        {
+            var vertices = new List<VertexPositionColor>();
+            var indices = new List<ushort>();
+        
+            var halfSize = size / 2;
+        
+            // Generate horizontal lines
+            for (int i = 0; i <= numCells; i++)
+            {
+                var z = -halfSize.Y + i * (size.Y / numCells);
+                vertices.Add(new VertexPositionColor(new Vector3(-halfSize.X, 0, z), new Vector4(1, 1, 1, 1)));
+                vertices.Add(new VertexPositionColor(new Vector3(halfSize.X, 0, z), new Vector4(1, 1, 1, 1)));
+                indices.Add((ushort)(vertices.Count - 2));
+                indices.Add((ushort)(vertices.Count - 1));
+            }
+        
+            // Generate vertical lines
+            for (int i = 0; i <= numCells; i++)
+            {
+                var x = -halfSize.X + i * (size.X / numCells);
+                vertices.Add(new VertexPositionColor(new Vector3(x, 0, -halfSize.Y), new Vector4(1, 1, 1, 1)));
+                vertices.Add(new VertexPositionColor(new Vector3(x, 0, halfSize.Y), new Vector4(1, 1, 1, 1)));
+                indices.Add((ushort)(vertices.Count - 2));
+                indices.Add((ushort)(vertices.Count - 1));
+            }
+        
+            return (vertices.ToArray(), indices.ToArray());
+        }
+
+        
+    
+        private void OnPointerPressed(object sender, PointerPressedEventArgs e)
+        {
+            _mouseDown = true;
+            _previousMousePosition = new Vector2((float)e.GetPosition(this).X, (float)e.GetPosition(this).Y); // Use X and Y properties
+        }
+    
+        private void OnPointerMoved(object sender, PointerEventArgs e)
+        {
+            if (_mouseDown)
+            {
+                var currentMousePosition = new Vector2((float)e.GetPosition(this).X, (float)e.GetPosition(this).Y); // Use X and Y properties
+                var delta = currentMousePosition - _previousMousePosition;
+    
+                if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+                {
+                    _cameraYaw += (float)delta.X * 0.01f; // Cast to float
+                    _cameraPitch -= (float)delta.Y * 0.01f; // Cast to float
+                    _cameraPitch = Math.Clamp(_cameraPitch, -MathF.PI / 2 + 0.01f, MathF.PI / 2 - 0.01f);
+                }
+                else if (e.GetCurrentPoint(this).Properties.IsRightButtonPressed)
+                {
+                    _cameraPosition += new Vector3((float)delta.X * -0.01f, (float)delta.Y * 0.01f, 0); // Cast to float
+                }
+    
+                _previousMousePosition = currentMousePosition;
+            }
+        }
+    
+        private void OnPointerReleased(object sender, PointerReleasedEventArgs e)
+        {
+            _mouseDown = false;
+        }
+    
+        private const string GridVertexCode = @"
+        #version 450
+        layout(location = 0) in vec3 Position;
+        layout(location = 1) in vec4 Color;
+        layout(location = 0) out vec4 v_Color;
+        void main()
+        {
+            gl_Position = vec4(Position, 1.0);
+            v_Color = Color;
+        }";
+    
+        private const string GridFragmentCode = @"
+        #version 450
+        layout(location = 0) in vec4 v_Color;
+        layout(location = 0) out vec4 fsout_Color;
+        void main()
+        {
+            fsout_Color = v_Color;
+        }";
+
         private void ResizeResources()
         {
             if (_graphicsDevice == null) return;
@@ -272,11 +416,13 @@ namespace VeldridSTLViewer
         }
         private void UpdateMVP()
         {
-            Matrix4x4 modelMatrix = _modelMatrix; // Use the model matrix
-            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(new Vector3(0, 0, 5), new Vector3(0, 0, 0), Vector3.UnitY);
-            float aspect = (float)Math.Max(1, Bounds.Width) / (float)Math.Max(1, Bounds.Height);
-            Matrix4x4 projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
-            Matrix4x4[] mvpMatrices = new Matrix4x4[] { modelMatrix, viewMatrix, projectionMatrix };
+            var modelMatrix = _modelMatrix;
+            var viewMatrix = Matrix4x4.CreateLookAt(_cameraPosition, _cameraPosition + Vector3.Transform(Vector3.UnitZ, Matrix4x4.CreateRotationX(_cameraPitch) * Matrix4x4.CreateRotationY(_cameraYaw)), Vector3.UnitY);
+            float aspect = (float)Bounds.Width / (float)Bounds.Height; // Cast to float
+            var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
+    
+            // Corrected Matrix4x4 initialization
+            Matrix4x4 mvpMatrices = new Matrix4x4 { modelMatrix, viewMatrix, projectionMatrix };
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
@@ -303,35 +449,35 @@ namespace VeldridSTLViewer
         }
 
         private (VertexPositionNormal[], ushort[]) LoadSTL(string path)
-{
-    var vertices = new System.Collections.Generic.List<VertexPositionNormal>();
-    var indices = new System.Collections.Generic.List<ushort>();
-    try
-    {
-        using (BinaryReader reader = new BinaryReader(File.OpenRead(path)))
         {
-            reader.ReadBytes(80); // Skip STL header.
-            int triangleCount = reader.ReadInt32();
-            for (int i = 0; i < triangleCount; i++)
+            var vertices = new System.Collections.Generic.List<VertexPositionNormal>();
+            var indices = new System.Collections.Generic.List<ushort>();
+            try
             {
-                Vector3 normal = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                for (int j = 0; j < 3; j++)
+                using (BinaryReader reader = new BinaryReader(File.OpenRead(path)))
                 {
-                    Vector3 position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                    vertices.Add(new VertexPositionNormal(position, normal));
-                    indices.Add((ushort)(vertices.Count - 1));
+                    reader.ReadBytes(80); // Skip STL header.
+                    int triangleCount = reader.ReadInt32();
+                    for (int i = 0; i < triangleCount; i++)
+                    {
+                        Vector3 normal = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                        for (int j = 0; j < 3; j++)
+                        {
+                            Vector3 position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                            vertices.Add(new VertexPositionNormal(position, normal));
+                            indices.Add((ushort)(vertices.Count - 1));
+                        }
+                        reader.ReadBytes(2); // Skip attribute byte count.
+                    }
                 }
-                reader.ReadBytes(2); // Skip attribute byte count.
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading STL file: {ex.Message}");
+                return (new VertexPositionNormal[0], new ushort[0]); // Return empty arrays
+            }
+            return (vertices.ToArray(), indices.ToArray());
         }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error loading STL file: {ex.Message}");
-        return (new VertexPositionNormal[0], new ushort[0]); // Return empty arrays
-    }
-    return (vertices.ToArray(), indices.ToArray());
-}
 
 
         public override void Render(Avalonia.Media.DrawingContext context)
@@ -376,6 +522,19 @@ namespace VeldridSTLViewer
             Console.WriteLine($"Draw - Bounds: {Bounds}");
             _commandList.SetViewport(0, new Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
             _commandList.SetScissorRect(0, 0, 0, (uint)Bounds.Width, (uint)Bounds.Height);
+
+
+
+            // Draw grid
+            _commandList.SetPipeline(_gridPipeline);
+            _commandList.SetVertexBuffer(0, _gridVertexBuffer);
+            _commandList.SetIndexBuffer(_gridIndexBuffer, IndexFormat.UInt16);
+            _commandList.DrawIndexed(
+                indexCount: (uint)_gridIndexBuffer.SizeInBytes / sizeof(ushort),
+                instanceCount: 1,
+                indexStart: 0,
+                vertexOffset: 0,
+                instanceStart: 0);
 
             _commandList.SetPipeline(_pipeline);
             _commandList.SetGraphicsResourceSet(0, _mvpResourceSet); // Use resource set
@@ -431,6 +590,19 @@ namespace VeldridSTLViewer
         {
             Position = position;
             Normal = normal;
+        }
+    }
+
+    struct VertexPositionColor
+    {
+        public const uint SizeInBytes = 28;
+        public Vector3 Position;
+        public Vector4 Color;
+    
+        public VertexPositionColor(Vector3 position, Vector4 color)
+        {
+            Position = position;
+            Color = color;
         }
     }
 }
