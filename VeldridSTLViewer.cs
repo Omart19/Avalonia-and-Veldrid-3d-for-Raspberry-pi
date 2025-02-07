@@ -1,4 +1,8 @@
-﻿//using System;
+﻿
+// standalone dotnet app script to run a veldrid view on the rpi
+
+
+//using System;
 //using System.IO;
 //using System.Numerics;
 //using Veldrid;
