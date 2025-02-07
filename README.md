@@ -35,7 +35,7 @@ This error is common with Veldrid, even outside of this specific project. To res
     ./ext/sync-shaderc.sh
     ```
 
-4.  **Build the native library:** Build the library for your platform (Linux x64 in this case).  You do *not* need to modify the build script, despite what might be mentioned in other instructions.
+4.  **Build the native library:** Build the library for your platform (Linux arm64 in this case).  You do *not* need to modify the build script, despite what might be mentioned in other instructions.
 
     ```bash
     ./build-native.sh -release linux-arm64
