@@ -37,6 +37,7 @@ namespace VeldridSTLViewer
             border.Child = veldridControl;
             mainPanel.Children.Add(border);
         }
+        
     }
 
     public class VeldridControl : Control
@@ -85,18 +86,38 @@ layout(location = 0) out vec4 fsout_Color;
 void main()
 {
     vec3 normal = normalize(v_Normal);
-    fsout_Color = vec4(normal * 0.5 + 0.5, 1.0); // Visualize normals
+    fsout_Color = vec4(abs(normal), 1.0); // Use absolute values
 }";
 
         public VeldridControl()
         {
             this.AttachedToVisualTree += OnAttachedToVisualTree;
             this.DetachedFromVisualTree += OnDetachedFromVisualTree;
+            this.Loaded += OnLoaded; // Add Loaded event handler
+        }
+        private void OnLoaded(object? sender, RoutedEventArgs e)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                this.InvalidateMeasure();
+                this.InvalidateArrange();
+                this.Measure(this.Bounds.Size);
+                this.Arrange(new Rect(this.Bounds.Size));
+            }, DispatcherPriority.Render); // Or DispatcherPriority.Loaded
         }
 
         private void OnAttachedToVisualTree(object sender, VisualTreeAttachmentEventArgs e)
         {
             InitializeVeldrid();
+
+            // Force a layout update *after* Veldrid is initialized and the control is attached:
+            Dispatcher.UIThread.Post(() =>
+            {
+                this.InvalidateMeasure();
+                this.InvalidateArrange();
+                this.Measure(this.Bounds.Size);
+                this.Arrange(new Rect(this.Bounds.Size));
+            }, DispatcherPriority.Loaded); // Use Loaded priority
         }
 
         private void OnDetachedFromVisualTree(object sender, VisualTreeAttachmentEventArgs e)
@@ -271,12 +292,30 @@ void main()
         }
         private void UpdateMVP()
         {
-            Matrix4x4 modelMatrix = _modelMatrix; // Use the model matrix
-            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(new Vector3(0, 0, 10), new Vector3(0, 0, 0), Vector3.UnitY);
+            // Systematically try different camera positions:
+            // 1. Original position:
+            //Vector3 cameraPosition = new Vector3(0, 0, 5);
+
+            // 2. Further back:
+            //Vector3 cameraPosition = new Vector3(0, 0, 10);
+
+            // 3. From the side:
+            // Vector3 cameraPosition = new Vector3(5, 0, 0);
+
+            // 4. From above:
+            // Vector3 cameraPosition = new Vector3(0, 5, 0);
+
+            // 5. From below and to the side:
+            Vector3 cameraPosition = new Vector3(2, -2, 2);
+
+            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(cameraPosition, new Vector3(0, 0, 0), Vector3.UnitY);
             float aspect = (float)Math.Max(1, Bounds.Width) / (float)Math.Max(1, Bounds.Height);
             Matrix4x4 projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
+            Matrix4x4 modelMatrix = _modelMatrix; // Use the model matrix
             Matrix4x4[] mvpMatrices = new Matrix4x4[] { modelMatrix, viewMatrix, projectionMatrix };
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
+
+            Console.WriteLine($"Camera Position: {cameraPosition}"); // Print camera position
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
         {
@@ -314,11 +353,20 @@ void main()
                     for (int i = 0; i < triangleCount; i++)
                     {
                         Vector3 normal = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                        Console.WriteLine($"Normal: {normal}"); // Print the normal
+
+                        // *** CHECK FOR ZERO-LENGTH NORMALS ***
+                        if (normal.LengthSquared() < 0.0001f) // Use LengthSquared for efficiency
+                        {
+                            Console.WriteLine($"Warning: Triangle {i} has a near-zero normal: {normal}");
+                            // Option 1: Skip this triangle (add 'continue;')
+                            // Option 2: Assign a default normal (e.g., Vector3.UnitY)
+                            normal = Vector3.UnitY; // Example: Assign a default normal
+                        }
+
+
                         for (int j = 0; j < 3; j++)
                         {
                             Vector3 position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                            Console.WriteLine($"Position: {position}"); //Print the position
                             vertices.Add(new VertexPositionNormal(position, normal));
                             indices.Add((ushort)(vertices.Count - 1));
                         }
@@ -333,7 +381,6 @@ void main()
             }
             return (vertices.ToArray(), indices.ToArray());
         }
-
 
         public override void Render(Avalonia.Media.DrawingContext context)
         {
