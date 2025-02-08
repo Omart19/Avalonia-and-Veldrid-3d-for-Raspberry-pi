@@ -117,16 +117,15 @@ void main()
 
         // Use the original fragment shader with lighting
         private const string FragmentCode = @"
-#version 450
-layout(location = 0) in vec3 v_Normal;
-layout(location = 0) out vec4 fsout_Color;
-void main()
-{
-    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5)); // Light direction
-    float brightness = max(dot(normalize(v_Normal), lightDir), 0.2); // Diffuse + ambient
-    fsout_Color = vec4(vec3(brightness), 1.0);
-}
-";
+        #version 450
+        layout(location = 0) in vec3 v_Normal;
+        layout(location = 0) out vec4 fsout_Color;
+        void main()
+        {
+            vec3 normal = normalize(v_Normal);
+            fsout_Color = vec4(abs(normal), 1.0); // Visualize normals (absolute value)
+        }
+        ";
 
         public VeldridControl()
         {
@@ -382,11 +381,41 @@ void main()
         }
         private void UpdateMVP()
         {
-            _cameraController.Update(0.016f, _input); // Pass in a delta time (e.g., 1/60th second) and input state.
-                                                      // 0.016f is good for 60FPS.  Adjust as needed.
-            var mvpMatrices = _cameraController.GetMVPMatrices(_modelMatrix); // Get combined matrices
+            // --- SYSTEMATIC CAMERA POSITION TESTING ---
+            // Try these one at a time, commenting out the others:
+
+            // 1. Original position (might be inside or too close)
+            // Vector3 cameraPosition = new Vector3(0, 0, 5);
+
+            // 2. Further back:
+            //Vector3 cameraPosition = new Vector3(0, 0, 10);
+
+            // 3. From the side:
+            // Vector3 cameraPosition = new Vector3(5, 0, 5);
+
+            // 4. From above:
+            // Vector3 cameraPosition = new Vector3(0, 5, 5);
+
+            // 5. From below and to the side:
+            Vector3 cameraPosition = new Vector3(2, -2, 2);
+
+            // 6. Very close (rule out near-plane clipping):
+            //  Vector3 cameraPosition = new Vector3(0, 0, 0.5f);
+
+
+            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(cameraPosition, new Vector3(0, 0, 0), Vector3.UnitY);
+            float aspect = (float)Math.Max(1, Bounds.Width) / (float)Math.Max(1, Bounds.Height);
+            Matrix4x4 projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
+
+            // --- TEMPORARILY DISABLE MODEL MATRIX (for debugging) ---
+            Matrix4x4 modelMatrix = Matrix4x4.Identity; //  Identity matrix
+                                                        //Matrix4x4 modelMatrix = _modelMatrix;  // Original line
+
+            Matrix4x4[] mvpMatrices = new Matrix4x4[] { modelMatrix, viewMatrix, projectionMatrix };
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
 
+            Console.WriteLine($"Camera Position: {cameraPosition}"); // Print camera position
+            Console.WriteLine($"viewMatrix: {viewMatrix}");
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
         {
@@ -425,15 +454,14 @@ void main()
                     {
                         Vector3 normal = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
 
-                        // *** CHECK FOR ZERO-LENGTH NORMALS ***
-                        if (normal.LengthSquared() < 0.0001f) // Use LengthSquared for efficiency
+                        // *** CHECK FOR ZERO-LENGTH NORMALS AND PRINT ***
+                        if (normal.LengthSquared() < 0.0001f)
                         {
                             Console.WriteLine($"Warning: Triangle {i} has a near-zero normal: {normal}");
-                            // Option 1: Skip this triangle (add 'continue;')
-                            // Option 2: Assign a default normal (e.g., Vector3.UnitY)
-                            normal = Vector3.UnitY; // Example: Assign a default normal
+                            //Optionally, we can skip this triangle.
+                            normal = Vector3.UnitY;
                         }
-
+                        Console.WriteLine($"Normal: {normal}"); // Print every normal
 
                         for (int j = 0; j < 3; j++)
                         {
@@ -450,9 +478,9 @@ void main()
                 Console.WriteLine($"Error loading STL file: {ex.Message}");
                 return (new VertexPositionNormal[0], new ushort[0]); // Return empty arrays
             }
+            Console.WriteLine($"Loaded Vertices count: {vertices.Count}");
             return (vertices.ToArray(), indices.ToArray());
         }
-
         public override void Render(Avalonia.Media.DrawingContext context)
         {
             _renderCount++;
@@ -492,16 +520,18 @@ void main()
             _commandList.SetFramebuffer(_offscreenFramebuffer);
             _commandList.ClearColorTarget(0, RgbaFloat.Black); // Clear to black
             _commandList.ClearDepthStencil(1f);
+
+            // Viewport and Scissor - Keep these as they are, they are correct
+            Console.WriteLine($"Draw - Bounds: {Bounds}"); // Verify bounds
             _commandList.SetViewport(0, new Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
             _commandList.SetScissorRect(0, 0, 0, (uint)Bounds.Width, (uint)Bounds.Height);
 
-            // Draw Grid
+            // Draw Grid (Keep this as it is)
             _commandList.SetPipeline(_gridPipeline);
-            _commandList.SetGraphicsResourceSet(0, _gridResourceSet); // Use grid resource set
+            _commandList.SetGraphicsResourceSet(0, _gridResourceSet);
             _commandList.SetVertexBuffer(0, _gridVertexBuffer);
-            _commandList.SetIndexBuffer(_gridIndexBuffer, IndexFormat.UInt16); // Use grid index buffer
-            _commandList.DrawIndexed((uint)_gridIndexBuffer.SizeInBytes / sizeof(ushort), 1, 0, 0, 0);  // Draw grid
-
+            _commandList.SetIndexBuffer(_gridIndexBuffer, IndexFormat.UInt16);
+            _commandList.DrawIndexed((uint)_gridIndexBuffer.SizeInBytes / sizeof(ushort), 1, 0, 0, 0);
 
             // Draw Model
             _commandList.SetPipeline(_pipeline);
@@ -515,14 +545,11 @@ void main()
                 vertexOffset: 0,
                 instanceStart: 0);
 
-
             _commandList.CopyTexture(_offscreenColorTexture, _stagingTexture);
             _commandList.End();
             _graphicsDevice.SubmitCommands(_commandList);
-            // _graphicsDevice.WaitForIdle(); // No longer needed
-
+            // _graphicsDevice.WaitForIdle(); // REMOVED - Use Dispatcher.InvokeAsync
         }
-
         private void CreateGridResources()
         {
             ResourceFactory factory = _graphicsDevice.ResourceFactory;

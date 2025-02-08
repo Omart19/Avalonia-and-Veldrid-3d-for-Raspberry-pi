@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "VeldridSTLViewer": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    }
+  }
+}
