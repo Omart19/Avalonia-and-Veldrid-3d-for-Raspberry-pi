@@ -12,7 +12,8 @@ using Veldrid.SPIRV;
 using Avalonia.Media.Imaging;
 using PixelFormat = Veldrid.PixelFormat;
 using Bitmap = Avalonia.Media.Imaging.Bitmap;
-using Avalonia.Interactivity; // For RoutedEventArgs
+using Avalonia.Interactivity;
+using Avalonia.Input; // For RoutedEventArgs
 
 namespace VeldridSTLViewer
 {
@@ -37,7 +38,7 @@ namespace VeldridSTLViewer
             border.Child = veldridControl;
             mainPanel.Children.Add(border);
         }
-        
+
     }
 
     public class VeldridControl : Control
@@ -59,6 +60,42 @@ namespace VeldridSTLViewer
         private Texture _stagingTexture;
         private bool _resourcesCreated = false;
         private int _renderCount = 0; // Counter for Render calls
+        private CameraController _cameraController;
+        private InputState _input; // Add this for input handling
+                                   // Add these fields to your VeldridControl class:
+        private DeviceBuffer _gridVertexBuffer;
+        private DeviceBuffer _gridIndexBuffer;
+        private Pipeline _gridPipeline;
+        private ResourceSet _gridResourceSet;
+        private ResourceLayout _gridResourceLayout;
+        private Shader[] _gridShaders;
+
+        // Add these constants for the grid shaders:
+        private const string GridVertexCode = @"
+#version 450
+layout(location = 0) in vec3 Position;
+layout(location = 1) in vec3 Color;
+layout(location = 0) out vec3 fsin_Color;
+layout(set = 0, binding = 0) uniform MVP
+{
+    mat4 Model;
+    mat4 View;
+    mat4 Projection;
+};
+void main()
+{
+    gl_Position = Projection * View * Model * vec4(Position, 1.0);
+    fsin_Color = Color;
+}";
+
+        private const string GridFragmentCode = @"
+#version 450
+layout(location = 0) in vec3 fsin_Color;
+layout(location = 0) out vec4 fsout_Color;
+void main()
+{
+    fsout_Color = vec4(fsin_Color, 1.0); // Use the color directly
+}";
 
         // Simplified shaders
         private const string VertexCode = @"
@@ -80,20 +117,29 @@ namespace VeldridSTLViewer
 
         // Use the original fragment shader with lighting
         private const string FragmentCode = @"
-        #version 450
+#version 450
 layout(location = 0) in vec3 v_Normal;
 layout(location = 0) out vec4 fsout_Color;
 void main()
 {
-    vec3 normal = normalize(v_Normal);
-    fsout_Color = vec4(abs(normal), 1.0); // Use absolute values
-}";
+    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5)); // Light direction
+    float brightness = max(dot(normalize(v_Normal), lightDir), 0.2); // Diffuse + ambient
+    fsout_Color = vec4(vec3(brightness), 1.0);
+}
+";
 
         public VeldridControl()
         {
+            this.Focusable = true; // Make sure the control can receive keyboard input.
             this.AttachedToVisualTree += OnAttachedToVisualTree;
             this.DetachedFromVisualTree += OnDetachedFromVisualTree;
-            this.Loaded += OnLoaded; // Add Loaded event handler
+
+            // Mouse and keyboard event handlers:
+            this.PointerMoved += OnPointerMoved;
+            this.PointerPressed += OnPointerPressed;
+            this.PointerReleased += OnPointerReleased;
+            this.KeyDown += OnKeyDown;
+            this.KeyUp += OnKeyUp;
         }
         private void OnLoaded(object? sender, RoutedEventArgs e)
         {
@@ -158,6 +204,31 @@ void main()
                 ResizeResources();
             }
         }
+        // Add these input event handler methods:
+        private void OnPointerMoved(object? sender, PointerEventArgs e)
+        {
+            _input.UpdateMousePosition(e.GetPosition(this));
+        }
+
+        private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
+        {
+            _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), true);
+            this.Focus(); // VERY IMPORTANT: Request focus when clicked
+        }
+
+        private void OnPointerReleased(object? sender, PointerReleasedEventArgs e)
+        {
+            _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), false);
+        }
+        private void OnKeyDown(object? sender, KeyEventArgs e)
+        {
+            _input.SetKeyDown(e.Key, true);
+        }
+
+        private void OnKeyUp(object? sender, KeyEventArgs e)
+        {
+            _input.SetKeyDown(e.Key, false);
+        }
         private void ResizeResources()
         {
             if (_graphicsDevice == null) return;
@@ -170,14 +241,26 @@ void main()
             _offscreenColorTexture.Dispose();
             _offscreenDepthTexture.Dispose();
             _stagingTexture.Dispose();
+            // Dispose of the grid resources
+            _gridPipeline.Dispose();
+            foreach (var shader in _gridShaders)
+            {
+                shader.Dispose();
+            }
+            _gridVertexBuffer.Dispose();
+            _gridIndexBuffer.Dispose();
+            _gridResourceSet.Dispose();
+            _gridResourceLayout.Dispose();
             _avaloniaBitmap?.Dispose(); _avaloniaBitmap = null;
 
             // Recreate size-dependent resources.
             CreateOffscreenFramebuffer();
             CreateStagingTexture();
             CreateAvaloniaBitmap();
+            CreateGridResources();
+            _cameraController.UpdateAspectRatio((float)Bounds.Width / (float)Bounds.Height); // Update aspect ratio
+            Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background);
 
-            // No need to call InvalidateVisual here, its done in render
         }
 
 
@@ -187,36 +270,34 @@ void main()
 
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
 
-            // --- Load STL ---
-            var (stlVertices, stlIndices) = LoadSTL("model.stl"); // Load the STL *data*
+            // --- Load STL (Keep this part as before) ---
+            var (stlVertices, stlIndices) = LoadSTL("model.stl");
             Console.WriteLine($"Loaded {stlVertices.Length} vertices and {stlIndices.Length} indices.");
 
             if (stlVertices.Length == 0)
             {
-                Console.WriteLine("ERROR: STL loading failed.");
+                Console.WriteLine("ERROR: STL loading failed.  Check model.stl path.");
                 return;
             }
+
             _modelMatrix = ComputeModelMatrix(stlVertices);
 
             _vertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(stlVertices.Length * VertexPositionNormal.SizeInBytes), BufferUsage.VertexBuffer));
-            _graphicsDevice.UpdateBuffer(_vertexBuffer, 0, stlVertices);  // Use stlVertices
+            _graphicsDevice.UpdateBuffer(_vertexBuffer, 0, stlVertices);
 
             _indexBuffer = factory.CreateBuffer(new BufferDescription((uint)(stlIndices.Length * sizeof(ushort)), BufferUsage.IndexBuffer));
-            _graphicsDevice.UpdateBuffer(_indexBuffer, 0, stlIndices); // Use stlIndices
+            _graphicsDevice.UpdateBuffer(_indexBuffer, 0, stlIndices);
+            // --- End Load STL ---
 
             _mvpBuffer = factory.CreateBuffer(new BufferDescription(3 * 64, BufferUsage.UniformBuffer));
             _mvpLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
                 new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
             _mvpResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_mvpLayout, _mvpBuffer));
-            // --- End Load STL ---
-
-
 
             VertexLayoutDescription vertexLayout = new VertexLayoutDescription(
-            new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
-            new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3) // Add back the normal
-            );
-
+                       new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                       new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3) // Include normal
+                   );
 
             ShaderDescription vertexShaderDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(VertexCode), "main");
             ShaderDescription fragmentShaderDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(FragmentCode), "main");
@@ -229,13 +310,13 @@ void main()
             {
                 BlendState = BlendStateDescription.SingleOverrideBlend,
                 RasterizerState = new RasterizerStateDescription(
-                    cullMode: FaceCullMode.Back, // Use back-face culling
+                    cullMode: FaceCullMode.Back,
                     fillMode: PolygonFillMode.Solid,
-                    frontFace: FrontFace.CounterClockwise, // Important:  Counter-Clockwise winding order
+                    frontFace: FrontFace.CounterClockwise,
                     depthClipEnabled: true,
                     scissorTestEnabled: false),
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
-                ResourceLayouts = new ResourceLayout[] { _mvpLayout }, // Use the MVP layout
+                ResourceLayouts = new ResourceLayout[] { _mvpLayout },
                 ShaderSet = new ShaderSetDescription(new VertexLayoutDescription[] { vertexLayout }, _shaders),
                 Outputs = _offscreenFramebuffer.OutputDescription
             };
@@ -243,9 +324,18 @@ void main()
             _commandList = factory.CreateCommandList();
 
             CreateAvaloniaBitmap();
-            _resourcesCreated = true;
 
+            // Create the CameraController and InputState *AFTER* the GraphicsDevice and resources are created:
+            _cameraController = new CameraController((float)this.Bounds.Width / (float)this.Bounds.Height);
+            _input = new InputState(); // Create the InputState
+
+            // Create grid resources
+            CreateGridResources();
+
+            _resourcesCreated = true;
+            Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background); // Invalidate visual
         }
+
         private void CreateOffscreenFramebuffer()
         {
             if (_graphicsDevice == null) return; // Important guard
@@ -292,30 +382,11 @@ void main()
         }
         private void UpdateMVP()
         {
-            // Systematically try different camera positions:
-            // 1. Original position:
-            //Vector3 cameraPosition = new Vector3(0, 0, 5);
-
-            // 2. Further back:
-            //Vector3 cameraPosition = new Vector3(0, 0, 10);
-
-            // 3. From the side:
-            // Vector3 cameraPosition = new Vector3(5, 0, 0);
-
-            // 4. From above:
-            // Vector3 cameraPosition = new Vector3(0, 5, 0);
-
-            // 5. From below and to the side:
-            Vector3 cameraPosition = new Vector3(2, -2, 2);
-
-            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(cameraPosition, new Vector3(0, 0, 0), Vector3.UnitY);
-            float aspect = (float)Math.Max(1, Bounds.Width) / (float)Math.Max(1, Bounds.Height);
-            Matrix4x4 projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
-            Matrix4x4 modelMatrix = _modelMatrix; // Use the model matrix
-            Matrix4x4[] mvpMatrices = new Matrix4x4[] { modelMatrix, viewMatrix, projectionMatrix };
+            _cameraController.Update(0.016f, _input); // Pass in a delta time (e.g., 1/60th second) and input state.
+                                                      // 0.016f is good for 60FPS.  Adjust as needed.
+            var mvpMatrices = _cameraController.GetMVPMatrices(_modelMatrix); // Get combined matrices
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
 
-            Console.WriteLine($"Camera Position: {cameraPosition}"); // Print camera position
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
         {
@@ -414,19 +485,27 @@ void main()
         private void Draw()
         {
             if (_graphicsDevice == null) return;
-            UpdateMVP();
+
+            UpdateMVP(); // Update camera and model matrices
+
             _commandList.Begin();
             _commandList.SetFramebuffer(_offscreenFramebuffer);
-            _commandList.ClearColorTarget(0, RgbaFloat.Black); // Clear to Black
+            _commandList.ClearColorTarget(0, RgbaFloat.Black); // Clear to black
             _commandList.ClearDepthStencil(1f);
-
-            // Viewport and Scissor
-            Console.WriteLine($"Draw - Bounds: {Bounds}");
             _commandList.SetViewport(0, new Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
             _commandList.SetScissorRect(0, 0, 0, (uint)Bounds.Width, (uint)Bounds.Height);
 
+            // Draw Grid
+            _commandList.SetPipeline(_gridPipeline);
+            _commandList.SetGraphicsResourceSet(0, _gridResourceSet); // Use grid resource set
+            _commandList.SetVertexBuffer(0, _gridVertexBuffer);
+            _commandList.SetIndexBuffer(_gridIndexBuffer, IndexFormat.UInt16); // Use grid index buffer
+            _commandList.DrawIndexed((uint)_gridIndexBuffer.SizeInBytes / sizeof(ushort), 1, 0, 0, 0);  // Draw grid
+
+
+            // Draw Model
             _commandList.SetPipeline(_pipeline);
-            _commandList.SetGraphicsResourceSet(0, _mvpResourceSet); // Use resource set
+            _commandList.SetGraphicsResourceSet(0, _mvpResourceSet);
             _commandList.SetVertexBuffer(0, _vertexBuffer);
             _commandList.SetIndexBuffer(_indexBuffer, IndexFormat.UInt16);
             _commandList.DrawIndexed(
@@ -434,12 +513,73 @@ void main()
                 instanceCount: 1,
                 indexStart: 0,
                 vertexOffset: 0,
-                instanceStart: 0); // Draw the triangle
+                instanceStart: 0);
+
 
             _commandList.CopyTexture(_offscreenColorTexture, _stagingTexture);
             _commandList.End();
             _graphicsDevice.SubmitCommands(_commandList);
-            // _graphicsDevice.WaitForIdle(); // REMOVED
+            // _graphicsDevice.WaitForIdle(); // No longer needed
+
+        }
+
+        private void CreateGridResources()
+        {
+            ResourceFactory factory = _graphicsDevice.ResourceFactory;
+
+            // Define grid vertices (XZ plane)
+            VertexPositionColor[] gridVertices = new VertexPositionColor[]
+            {
+        new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)), // Gray
+        new VertexPositionColor(new Vector3(-10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
+            };
+
+            ushort[] gridIndices = new ushort[] { 0, 1, 2, 3 };
+
+            _gridVertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(gridVertices.Length * VertexPositionColor.SizeInBytes), BufferUsage.VertexBuffer));
+            _graphicsDevice.UpdateBuffer(_gridVertexBuffer, 0, gridVertices);
+
+            _gridIndexBuffer = factory.CreateBuffer(new BufferDescription((uint)(gridIndices.Length * sizeof(ushort)), BufferUsage.IndexBuffer));
+            _graphicsDevice.UpdateBuffer(_gridIndexBuffer, 0, gridIndices);
+
+            // Shaders for the grid (simplified - no lighting, just color)
+
+            ShaderDescription gridVertexShaderDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(GridVertexCode), "main");
+            ShaderDescription gridFragmentShaderDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(GridFragmentCode), "main");
+            _gridShaders = factory.CreateFromSpirv(gridVertexShaderDesc, gridFragmentShaderDesc);
+
+
+            // Vertex layout for grid (position + color)
+            VertexLayoutDescription gridVertexLayout = new VertexLayoutDescription(
+                new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                new VertexElementDescription("Color", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3) // Color
+            );
+
+            // Resource layout and set for the grid (use the same MVP layout)
+            _gridResourceLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
+            new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+
+            _gridResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_gridResourceLayout, _mvpBuffer)); // Reuse MVP buffer
+
+
+            // Pipeline for the grid
+            GraphicsPipelineDescription gridPipelineDescription = new GraphicsPipelineDescription
+            {
+                BlendState = BlendStateDescription.SingleOverrideBlend,
+                RasterizerState = new RasterizerStateDescription(
+                    cullMode: FaceCullMode.None, // Don't cull for the grid
+                    fillMode: PolygonFillMode.Solid,  //  can change to Wireframe
+                    frontFace: FrontFace.CounterClockwise,
+                    depthClipEnabled: true,
+                    scissorTestEnabled: false),
+                PrimitiveTopology = PrimitiveTopology.LineStrip, // Use LineStrip for grid
+                ResourceLayouts = new ResourceLayout[] { _gridResourceLayout }, // Grid layout
+                ShaderSet = new ShaderSetDescription(new VertexLayoutDescription[] { gridVertexLayout }, _gridShaders),
+                Outputs = _offscreenFramebuffer.OutputDescription
+            };
+            _gridPipeline = factory.CreateGraphicsPipeline(gridPipelineDescription);
         }
 
 
@@ -465,6 +605,17 @@ void main()
             _offscreenColorTexture?.Dispose();
             _offscreenDepthTexture?.Dispose();
             _stagingTexture?.Dispose();
+            // Dispose of the grid resources
+            _gridPipeline.Dispose();
+            foreach (var shader in _gridShaders)
+            {
+                shader.Dispose();
+            }
+            _gridVertexBuffer.Dispose();
+            _gridIndexBuffer.Dispose();
+            _gridResourceSet.Dispose();
+            _gridResourceLayout.Dispose();
+
             _graphicsDevice?.Dispose();
             _avaloniaBitmap = null;
         }
@@ -479,6 +630,17 @@ void main()
         {
             Position = position;
             Normal = normal;
+        }
+    }
+    struct VertexPositionColor
+    {
+        public const uint SizeInBytes = 24; // 3 floats for position + 3 for color
+        public Vector3 Position;
+        public Vector3 Color;
+        public VertexPositionColor(Vector3 position, Vector3 color)
+        {
+            Position = position;
+            Color = color;
         }
     }
 }
