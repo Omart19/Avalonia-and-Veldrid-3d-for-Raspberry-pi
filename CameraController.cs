@@ -96,7 +96,7 @@ namespace VeldridSTLViewer
 
         private void UpdateProjectionMatrix()
         {
-            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.1f, 100f);
+            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.5f, 50f);
         }
 
         public Matrix4x4[] GetMVPMatrices(Matrix4x4 modelMatrix) // Takes model matrix as parameter

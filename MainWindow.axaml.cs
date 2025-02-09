@@ -180,9 +180,9 @@ void main()
                 {
                     PreferStandardClipSpaceYDirection = true,
                     PreferDepthRangeZeroToOne = true,
-                    SyncToVerticalBlank = false, //VSync off is important
-                    ResourceBindingModel = ResourceBindingModel.Improved,
-                    SwapchainDepthFormat = PixelFormat.D24_UNorm_S8_UInt,
+                    SyncToVerticalBlank = true, //VSync off is important
+                    ResourceBindingModel = ResourceBindingModel.Default,
+                    SwapchainDepthFormat = PixelFormat.R32_G32_B32_A32_Float,
                     Debug = true // Enable Veldrid debug mode
                 };
 
@@ -358,7 +358,7 @@ void main()
 
             _offscreenDepthTexture = factory.CreateTexture(TextureDescription.Texture2D(
                 (uint)Math.Max(1, Bounds.Width), (uint)Math.Max(1, Bounds.Height), 1, 1,
-                PixelFormat.D24_UNorm_S8_UInt, TextureUsage.DepthStencil));  // Use a standard depth format
+                PixelFormat.D32_Float_S8_UInt, TextureUsage.DepthStencil));  // Use a standard depth format
             _offscreenDepthTexture.Name = "OffscreenDepthTexture";  // Give it a name!
 
             _offscreenFramebuffer = factory.CreateFramebuffer(new FramebufferDescription(_offscreenDepthTexture, _offscreenColorTexture));
@@ -380,8 +380,8 @@ void main()
         private void CreateAvaloniaBitmap()
         {
             if (_graphicsDevice == null) return;
-            var pixelFormat = Avalonia.Platform.PixelFormat.Rgba8888; // Explicitly define
-            var alphaFormat = Avalonia.Platform.AlphaFormat.Unpremul;
+            var pixelFormat = Avalonia.Platform.PixelFormat.Rgb32; // Explicitly define
+            var alphaFormat = Avalonia.Platform.AlphaFormat.Premul;
 
             Console.WriteLine($"Avalonia Bitmap Pixel Format: {pixelFormat}"); // Check
 
@@ -489,9 +489,27 @@ void main()
                 using (var lockedBitmap = _avaloniaBitmap.Lock())
                 {
                     MappedResourceView<byte> map = _graphicsDevice.Map<byte>(_stagingTexture, MapMode.Read);
-                    byte[] pixelData = new byte[(int)map.MappedResource.SizeInBytes];
-                    Marshal.Copy(map.MappedResource.Data, pixelData, 0, (int)map.MappedResource.SizeInBytes);
-                    Marshal.Copy(pixelData, 0, lockedBitmap.Address, (int)map.MappedResource.SizeInBytes);
+                    //byte[] pixelData = new byte[(int)map.MappedResource.SizeInBytes];
+                    //Marshal.Copy(map.MappedResource.Data, pixelData, 0, (int)map.MappedResource.SizeInBytes);
+                    //Marshal.Copy(pixelData, 0, lockedBitmap.Address, (int)map.MappedResource.SizeInBytes);
+                    try
+                    {
+
+                        unsafe
+                        {
+                            Buffer.MemoryCopy(
+                                 (void*)map.MappedResource.Data,          // Source
+                                 (void*)lockedBitmap.Address,       // Destination
+                                 (int)map.MappedResource.SizeInBytes, // Destination size
+                                 (int)map.MappedResource.SizeInBytes   // Source size
+                             );
+                        }
+
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.ToString());
+                    }
                     _graphicsDevice.Unmap(_stagingTexture);
                 }
 

@@ -20,6 +20,6 @@ public static AppBuilder BuildAvaloniaApp()
     => AppBuilder.Configure<App>()
         .UsePlatformDetect()
         .LogToTrace()
-        .UseReactiveUI();
+        .UseSkia(); // Use Skia for rendering
 
 }
