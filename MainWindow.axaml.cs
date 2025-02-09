@@ -62,13 +62,15 @@ namespace VeldridSTLViewer
         private int _renderCount = 0; // Counter for Render calls
         private CameraController _cameraController;
         private InputState _input; // Add this for input handling
-                                   // Add these fields to your VeldridControl class:
+        private Avalonia.Point _previousMousePosition; // Store the previous mouse position
         private DeviceBuffer _gridVertexBuffer;
         private DeviceBuffer _gridIndexBuffer;
         private Pipeline _gridPipeline;
         private ResourceSet _gridResourceSet;
         private ResourceLayout _gridResourceLayout;
         private Shader[] _gridShaders;
+        private Matrix4x4 _gridModelMatrix = Matrix4x4.Identity;
+
 
         // Add these constants for the grid shaders:
         private const string GridVertexCode = @"
@@ -117,16 +119,15 @@ void main()
 
         // Use the original fragment shader with lighting
         private const string FragmentCode = @"
-#version 450
-layout(location = 0) in vec3 v_Normal;
-layout(location = 0) out vec4 fsout_Color;
-void main()
-{
-vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along -Z)
-    float brightness = abs(dot(normalize(v_Normal), lightDir)); // ABSOLUTE VALUE of dot product
-    fsout_Color = vec4(vec3(brightness), 1.0);
-}
-";
+            #version 450
+            layout(location = 0) in vec3 v_Normal;
+            layout(location = 0) out vec4 fsout_Color;
+            void main()
+            {
+                vec3 lightDir = normalize(vec3(0.5, 1.0, 0.5));
+                float brightness = max(dot(normalize(v_Normal), lightDir), 0.2);
+                fsout_Color = vec4(vec3(brightness), 1.0);
+            }";
 
         public VeldridControl()
         {
@@ -141,16 +142,16 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
             this.KeyDown += OnKeyDown;
             this.KeyUp += OnKeyUp;
         }
-        private void OnLoaded(object? sender, RoutedEventArgs e)
-        {
-            Dispatcher.UIThread.Post(() =>
-            {
-                this.InvalidateMeasure();
-                this.InvalidateArrange();
-                this.Measure(this.Bounds.Size);
-                this.Arrange(new Rect(this.Bounds.Size));
-            }, DispatcherPriority.Render); // Or DispatcherPriority.Loaded
-        }
+        //private void OnLoaded(object? sender, RoutedEventArgs e)
+        //{
+        //    Dispatcher.UIThread.Post(() =>
+        //    {
+        //        this.InvalidateMeasure();
+        //        this.InvalidateArrange();
+        //        this.Measure(this.Bounds.Size);
+        //        this.Arrange(new Rect(this.Bounds.Size));
+        //    }, DispatcherPriority.Render); // Or DispatcherPriority.Loaded
+        //}
 
         private void OnAttachedToVisualTree(object sender, VisualTreeAttachmentEventArgs e)
         {
@@ -207,18 +208,29 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
         // Add these input event handler methods:
         private void OnPointerMoved(object? sender, PointerEventArgs e)
         {
-            _input.UpdateMousePosition(e.GetPosition(this));
+            if (e != null && _input != null)
+            {
+                Avalonia.Point currentPosition = e.GetPosition(this);
+                _input.MouseDelta = currentPosition - _previousMousePosition; // Calculate delta here
+                _previousMousePosition = currentPosition; // Update previous position
+            }
         }
 
         private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
         {
-            _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), true);
-            this.Focus(); // VERY IMPORTANT: Request focus when clicked
+            if (e != null && _input != null)
+            {
+                _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), true);
+                this.Focus();
+            }
         }
 
         private void OnPointerReleased(object? sender, PointerReleasedEventArgs e)
         {
-            _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), false);
+            if (e != null && _input != null)
+            {
+                _input.SetMouseDown(e.GetCurrentPoint(this).Properties.PointerUpdateKind.GetMouseButton(), false);
+            }
         }
         private void OnKeyDown(object? sender, KeyEventArgs e)
         {
@@ -333,7 +345,7 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
             CreateGridResources();
 
             _resourcesCreated = true;
-            Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background);
+            //Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background);
         }
         private void CreateOffscreenFramebuffer()
         {
@@ -384,8 +396,8 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
         private void UpdateMVP()
         {
             _cameraController.Update(0.016f, _input);
-            var mvpMatrices = _cameraController.GetMVPMatrices(_modelMatrix);
-            _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
+            //var mvpMatrices = _cameraController.GetMVPMatrices(_modelMatrix);
+            _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, _cameraController.GetMVPMatrices(_modelMatrix)); // Get combined matrices.
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
         {
@@ -401,7 +413,7 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
                 max = Vector3.Max(max, v.Position);
             }
             Vector3 center = (min + max) / 2;
-            float modelSize = Vector3.Distance(min, max);
+            float modelSize = MathF.Max(max.X - min.X, MathF.Max(max.Y - min.Y, max.Z - min.Z));
             float desiredSize = 2.0f;
             float scaleFactor = desiredSize / modelSize;
             Console.WriteLine($"Scale Factor Before: {scaleFactor}");
@@ -464,8 +476,8 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
         }
         public override void Render(Avalonia.Media.DrawingContext context)
         {
-            _renderCount++;
-            Console.WriteLine($"Render called. Count: {_renderCount}"); // Check if Render is called
+            //_renderCount++;
+            //Console.WriteLine($"Render called. Count: {_renderCount}"); // Check if Render is called
 
             if (!_resourcesCreated) return;
 
@@ -489,6 +501,8 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
 
             // Invalidate visual AFTER the copy:
             Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background);
+            _input.ClearDelta();// Clear delta after using it
+
         }
 
         private void Draw()
@@ -535,81 +549,87 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
         {
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
 
-            // Define grid vertices (XZ plane)
             // Define grid vertices (XZ plane) - More lines for a denser grid
+            // and centered at the origin
             VertexPositionColor[] gridVertices = new VertexPositionColor[]
             {
-        //Horizontal lines
-        new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            // Horizontal lines (constant Z, varying X)
+            new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
 
-         new VertexPositionColor(new Vector3(-10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
 
-         new VertexPositionColor(new Vector3(-10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
 
-         new VertexPositionColor(new Vector3(-10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3( 10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        //Vertical lines
-         new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            // Vertical lines (constant X, varying Z)
 
-         new VertexPositionColor(new Vector3(-8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(-8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(-6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+             new VertexPositionColor(new Vector3(-8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(-4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(-2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(-2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(0, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(0, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(-2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-         new VertexPositionColor(new Vector3(2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(0, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(0, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+             new VertexPositionColor(new Vector3(2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
 
-        new VertexPositionColor(new Vector3(8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3(8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
-                    new VertexPositionColor(new Vector3(10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+            new VertexPositionColor(new Vector3(8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+            new VertexPositionColor(new Vector3(10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
             new VertexPositionColor(new Vector3(10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
-        };
+            };
 
-            //More indices for more lines.
-            ushort[] gridIndices = new ushort[] { 0,1, 2,3, 4,5, 6,7, 8,9, 10,11, 12,13, 14,15, 16,17, 18,19, 20,21,
-                                             22,23, 24,25, 26,27, 28,29, 30,31, 32,33, 34,35, 36,37, 38,39, 40,41 };
+            // Indices for LineList
+            ushort[] gridIndices = new ushort[] {
+            0, 1,   2, 3,   4, 5,   6, 7,   8, 9,  10, 11,
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+            22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            };
 
             _gridVertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(gridVertices.Length * VertexPositionColor.SizeInBytes), BufferUsage.VertexBuffer));
             _graphicsDevice.UpdateBuffer(_gridVertexBuffer, 0, gridVertices);
@@ -618,24 +638,21 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
             _graphicsDevice.UpdateBuffer(_gridIndexBuffer, 0, gridIndices);
 
             // Shaders for the grid (simplified - no lighting, just color)
-
             ShaderDescription gridVertexShaderDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(GridVertexCode), "main");
             ShaderDescription gridFragmentShaderDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(GridFragmentCode), "main");
             _gridShaders = factory.CreateFromSpirv(gridVertexShaderDesc, gridFragmentShaderDesc);
 
-
             // Vertex layout for grid (position + color)
             VertexLayoutDescription gridVertexLayout = new VertexLayoutDescription(
                 new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
-                new VertexElementDescription("Color", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3) // Color
+                new VertexElementDescription("Color", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3)
             );
 
             // Resource layout and set for the grid (use the same MVP layout)
             _gridResourceLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
-            new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+                new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
 
             _gridResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_gridResourceLayout, _mvpBuffer)); // Reuse MVP buffer
-
 
             // Pipeline for the grid
             GraphicsPipelineDescription gridPipelineDescription = new GraphicsPipelineDescription
@@ -643,18 +660,18 @@ vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along 
                 BlendState = BlendStateDescription.SingleOverrideBlend,
                 RasterizerState = new RasterizerStateDescription(
                     cullMode: FaceCullMode.None, // Don't cull for the grid
-                    fillMode: PolygonFillMode.Solid,  //  can change to Wireframe
+                    fillMode: PolygonFillMode.Solid,
                     frontFace: FrontFace.CounterClockwise,
                     depthClipEnabled: true,
                     scissorTestEnabled: false),
-                PrimitiveTopology = PrimitiveTopology.LineStrip, // Use LineStrip for grid
+                PrimitiveTopology = PrimitiveTopology.LineList, // Use LineList for the grid
                 ResourceLayouts = new ResourceLayout[] { _gridResourceLayout }, // Grid layout
                 ShaderSet = new ShaderSetDescription(new VertexLayoutDescription[] { gridVertexLayout }, _gridShaders),
                 Outputs = _offscreenFramebuffer.OutputDescription
             };
+
             _gridPipeline = factory.CreateGraphicsPipeline(gridPipelineDescription);
         }
-
 
         private void DisposeResources()
         {
