@@ -117,15 +117,16 @@ void main()
 
         // Use the original fragment shader with lighting
         private const string FragmentCode = @"
-        #version 450
-        layout(location = 0) in vec3 v_Normal;
-        layout(location = 0) out vec4 fsout_Color;
-        void main()
-        {
-            vec3 normal = normalize(v_Normal);
-            fsout_Color = vec4(abs(normal), 1.0); // Visualize normals (absolute value)
-        }
-        ";
+#version 450
+layout(location = 0) in vec3 v_Normal;
+layout(location = 0) out vec4 fsout_Color;
+void main()
+{
+vec3 lightDir = normalize(vec3(0.0, 0.0, 1.0));  // Light from the front (along -Z)
+    float brightness = abs(dot(normalize(v_Normal), lightDir)); // ABSOLUTE VALUE of dot product
+    fsout_Color = vec4(vec3(brightness), 1.0);
+}
+";
 
         public VeldridControl()
         {
@@ -269,7 +270,7 @@ void main()
 
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
 
-            // --- Load STL (Keep this part as before) ---
+            // --- Load STL --- (Keep this as it is)
             var (stlVertices, stlIndices) = LoadSTL("model.stl");
             Console.WriteLine($"Loaded {stlVertices.Length} vertices and {stlIndices.Length} indices.");
 
@@ -294,9 +295,9 @@ void main()
             _mvpResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_mvpLayout, _mvpBuffer));
 
             VertexLayoutDescription vertexLayout = new VertexLayoutDescription(
-                       new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
-                       new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3) // Include normal
-                   );
+                new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3)
+            );
 
             ShaderDescription vertexShaderDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(VertexCode), "main");
             ShaderDescription fragmentShaderDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(FragmentCode), "main");
@@ -324,17 +325,16 @@ void main()
 
             CreateAvaloniaBitmap();
 
-            // Create the CameraController and InputState *AFTER* the GraphicsDevice and resources are created:
+            // --- CAMERA CONTROLLER INITIALIZATION ---
             _cameraController = new CameraController((float)this.Bounds.Width / (float)this.Bounds.Height);
-            _input = new InputState(); // Create the InputState
-
-            // Create grid resources
+            _input = new InputState(); // Create instance of InputState
+            _cameraController.SetCameraPosition(new Vector3(2, 2, 2));  // Example position
+            _cameraController.SetCameraRotation(0, 0); //set initial rotation
             CreateGridResources();
 
             _resourcesCreated = true;
-            Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background); // Invalidate visual
+            Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Background);
         }
-
         private void CreateOffscreenFramebuffer()
         {
             if (_graphicsDevice == null) return; // Important guard
@@ -379,49 +379,19 @@ void main()
                 pixelFormat, // Use defined format
                 alphaFormat);
         }
+        //Vector3 cameraPosition = new Vector3(0, 0, 5);
+
         private void UpdateMVP()
         {
-            // --- SYSTEMATIC CAMERA POSITION TESTING ---
-            // Try these one at a time, commenting out the others:
-
-            // 1. Original position (might be inside or too close)
-            // Vector3 cameraPosition = new Vector3(0, 0, 5);
-
-            // 2. Further back:
-            //Vector3 cameraPosition = new Vector3(0, 0, 10);
-
-            // 3. From the side:
-            // Vector3 cameraPosition = new Vector3(5, 0, 5);
-
-            // 4. From above:
-            // Vector3 cameraPosition = new Vector3(0, 5, 5);
-
-            // 5. From below and to the side:
-            Vector3 cameraPosition = new Vector3(2, -2, 2);
-
-            // 6. Very close (rule out near-plane clipping):
-            //  Vector3 cameraPosition = new Vector3(0, 0, 0.5f);
-
-
-            Matrix4x4 viewMatrix = Matrix4x4.CreateLookAt(cameraPosition, new Vector3(0, 0, 0), Vector3.UnitY);
-            float aspect = (float)Math.Max(1, Bounds.Width) / (float)Math.Max(1, Bounds.Height);
-            Matrix4x4 projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, aspect, 0.1f, 100f);
-
-            // --- TEMPORARILY DISABLE MODEL MATRIX (for debugging) ---
-            Matrix4x4 modelMatrix = Matrix4x4.Identity; //  Identity matrix
-                                                        //Matrix4x4 modelMatrix = _modelMatrix;  // Original line
-
-            Matrix4x4[] mvpMatrices = new Matrix4x4[] { modelMatrix, viewMatrix, projectionMatrix };
+            _cameraController.Update(0.016f, _input);
+            var mvpMatrices = _cameraController.GetMVPMatrices(_modelMatrix);
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvpMatrices);
-
-            Console.WriteLine($"Camera Position: {cameraPosition}"); // Print camera position
-            Console.WriteLine($"viewMatrix: {viewMatrix}");
         }
         private Matrix4x4 ComputeModelMatrix(VertexPositionNormal[] vertices)
         {
             if (vertices.Length == 0)
             {
-                return Matrix4x4.Identity; // CRUCIAL: Return identity if no vertices
+                return Matrix4x4.Identity;
             }
             Vector3 min = new Vector3(float.MaxValue);
             Vector3 max = new Vector3(float.MinValue);
@@ -434,10 +404,21 @@ void main()
             float modelSize = Vector3.Distance(min, max);
             float desiredSize = 2.0f;
             float scaleFactor = desiredSize / modelSize;
+            Console.WriteLine($"Scale Factor Before: {scaleFactor}");
+            //Prevent the scale from being zero or infinity.
+            if (float.IsNaN(scaleFactor) || float.IsInfinity(scaleFactor))
+            {
+                scaleFactor = 1.0f;
+                Console.WriteLine("Scale factor was NaN or Infinity. Setting to 1.0");
+            }
+            Console.WriteLine($"Scale Factor After: {scaleFactor}");
             Matrix4x4 translation = Matrix4x4.CreateTranslation(-center);
             Matrix4x4 scale = Matrix4x4.CreateScale(scaleFactor);
-            Console.WriteLine($"Scale Factor: {scaleFactor}");
-            return translation * scale; // Corrected matrix multiplication
+            Console.WriteLine($"ComputeModelMatrix - Min: {min}, Max: {max}, Center: {center}, ScaleFactor: {scaleFactor}"); // Keep this
+            var result = translation * scale;
+
+            Console.WriteLine($"Result Matrix: {result}");
+            return result;
         }
 
         private (VertexPositionNormal[], ushort[]) LoadSTL(string path)
@@ -522,7 +503,7 @@ void main()
             _commandList.ClearDepthStencil(1f);
 
             // Viewport and Scissor - Keep these as they are, they are correct
-            Console.WriteLine($"Draw - Bounds: {Bounds}"); // Verify bounds
+            //Console.WriteLine($"Draw - Bounds: {Bounds}"); // Verify bounds
             _commandList.SetViewport(0, new Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
             _commandList.SetScissorRect(0, 0, 0, (uint)Bounds.Width, (uint)Bounds.Height);
 
@@ -555,15 +536,80 @@ void main()
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
 
             // Define grid vertices (XZ plane)
+            // Define grid vertices (XZ plane) - More lines for a denser grid
             VertexPositionColor[] gridVertices = new VertexPositionColor[]
             {
-        new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)), // Gray
-        new VertexPositionColor(new Vector3(-10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
+        //Horizontal lines
+        new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
         new VertexPositionColor(new Vector3( 10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
-        new VertexPositionColor(new Vector3( 10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
-            };
 
-            ushort[] gridIndices = new ushort[] { 0, 1, 2, 3 };
+        new VertexPositionColor(new Vector3(-10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, -8), new Vector3(0.5f, 0.5f, 0.5f)),
+
+         new VertexPositionColor(new Vector3(-10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, -6), new Vector3(0.5f, 0.5f, 0.5f)),
+
+         new VertexPositionColor(new Vector3(-10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, -4), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, -2), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 0), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 2), new Vector3(0.5f, 0.5f, 0.5f)),
+
+         new VertexPositionColor(new Vector3(-10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 4), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 6), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 8), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3( 10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        //Vertical lines
+         new VertexPositionColor(new Vector3(-10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(-10, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+         new VertexPositionColor(new Vector3(-8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(-8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(-6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(-4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(-2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(-2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(0, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(0, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+         new VertexPositionColor(new Vector3(2, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(2, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(4, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(4, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(6, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(6, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+
+        new VertexPositionColor(new Vector3(8, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+        new VertexPositionColor(new Vector3(8, 0, 10), new Vector3(0.5f, 0.5f, 0.5f)),
+                    new VertexPositionColor(new Vector3(10, 0, -10), new Vector3(0.5f, 0.5f, 0.5f)),
+            new VertexPositionColor(new Vector3(10, 0,  10), new Vector3(0.5f, 0.5f, 0.5f)),
+        };
+
+            //More indices for more lines.
+            ushort[] gridIndices = new ushort[] { 0,1, 2,3, 4,5, 6,7, 8,9, 10,11, 12,13, 14,15, 16,17, 18,19, 20,21,
+                                             22,23, 24,25, 26,27, 28,29, 30,31, 32,33, 34,35, 36,37, 38,39, 40,41 };
 
             _gridVertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(gridVertices.Length * VertexPositionColor.SizeInBytes), BufferUsage.VertexBuffer));
             _graphicsDevice.UpdateBuffer(_gridVertexBuffer, 0, gridVertices);
