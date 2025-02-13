@@ -1,26 +1,24 @@
-﻿using Avalonia;
+﻿//InputState.cs
+using Avalonia;
 using Avalonia.Input;
 
 namespace VeldridSTLViewer
 {
     public class InputState
     {
-        public Point MousePosition { get; private set; }
-        public Point MouseDelta { get; set; }
+        //public Point MousePosition { get; private set; } // No longer needed
+        public Point MouseDelta { get; set; } //remove private
         private readonly bool[] _mouseDown = new bool[256]; // Large enough for all mouse buttons
         private readonly bool[] _keyDown = new bool[256];   // Large enough for all keys
-        private Point _previousMousePosition;
+                                                            // private Point _previousMousePosition; // No longer needed
 
-        public void UpdateMousePosition(Point position)
-        {
-            MouseDelta = position - _previousMousePosition;
-            _previousMousePosition = position;
-            MousePosition = position;
-        }
-        public void UpdateMouseDelta(Point delta)
-        {
-            MouseDelta = delta;
-        }
+        // We NO LONGER calculate the delta here.  Avalonia will give it to us.
+        //public void UpdateMousePosition(Point position)
+        //{
+        //    MouseDelta = position - _previousMousePosition;
+        //    _previousMousePosition = position;
+        //    MousePosition = position;
+        //}
 
         // Use MouseButton instead of PointerMouseButton
         public bool IsMouseDown(MouseButton button)
@@ -43,6 +41,7 @@ namespace VeldridSTLViewer
         {
             _keyDown[(int)key] = pressed;
         }
+        // Add a method to clear the delta *after* it's been used:
         public void ClearDelta()
         {
             MouseDelta = new Point(0, 0);

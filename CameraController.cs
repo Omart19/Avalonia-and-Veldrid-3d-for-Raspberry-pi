@@ -1,6 +1,7 @@
-﻿using System;
+﻿//CameraController.cs
+using System;
 using System.Numerics;
-using Avalonia.Input;
+using Avalonia.Input; // For Key and Pointer events
 
 namespace VeldridSTLViewer
 {
@@ -12,22 +13,22 @@ namespace VeldridSTLViewer
         private Vector3 _cameraPosition = new Vector3(0, 0, 5);
         private float _yaw = 0f;
         private float _pitch = 0f;
-        private float _moveSpeed = 2.0f;  // Adjust as needed
+        private float _moveSpeed = 2.0f; // Adjust as needed
         private float _rotationSpeed = 0.01f; // Adjust
         private float _aspectRatio;
 
         public CameraController(float aspectRatio)
         {
             _aspectRatio = aspectRatio;
-            UpdateViewMatrix(); // Initialize
-            UpdateProjectionMatrix(); // Initialize
+            UpdateViewMatrix(); // Initialize the view matrix
+            UpdateProjectionMatrix(); // Initialize proj matrix
         }
 
         // Set initial camera position
         public void SetCameraPosition(Vector3 position)
         {
             _cameraPosition = position;
-            UpdateViewMatrix();
+            UpdateViewMatrix(); // Recalculate whenever position changes
         }
 
         // Set initial camera rotation
@@ -35,14 +36,14 @@ namespace VeldridSTLViewer
         {
             _yaw = yaw;
             _pitch = pitch;
-            UpdateViewMatrix();
+            UpdateViewMatrix(); // Recalculate whenever rotation changes.
         }
 
         public void Update(double deltaTime, InputState input)
         {
             float deltaSeconds = (float)deltaTime;
 
-            // Camera Movement (WASD) - Corrected transformation
+            // Camera Movement (WASD) - Corrected Transformation
             Matrix4x4 rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
             if (input.IsKeyDown(Key.W))
             {
@@ -77,29 +78,21 @@ namespace VeldridSTLViewer
             _aspectRatio = aspectRatio;
             UpdateProjectionMatrix();
         }
-
         private void UpdateViewMatrix()
         {
-            // *** CORRECTED CAMERA TARGET CALCULATION ***
-            Matrix4x4 rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
-            // Calculate a direction vector.  Transform UnitZ by the rotation.
-            Vector3 cameraDirection = Vector3.Transform(-Vector3.UnitZ, rotation); // Look *FORWARD*
-            Vector3 cameraTarget = _cameraPosition + cameraDirection; // Target is *in front* of the camera
+            var rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
+            Vector3 cameraTarget = _cameraPosition + Vector3.Transform(-Vector3.UnitZ, rotation);
             Vector3 cameraUp = Vector3.Transform(Vector3.UnitY, rotation);
             ViewMatrix = Matrix4x4.CreateLookAt(_cameraPosition, cameraTarget, cameraUp);
-
-            //Console.WriteLine($"UpdateViewMatrix - Camera Pos: {_cameraPosition}, Yaw: {_yaw}, Pitch: {_pitch}"); // Debug
-            //Console.WriteLine($"ViewMatrix: {ViewMatrix}");
-
         }
 
 
         private void UpdateProjectionMatrix()
         {
-            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.5f, 50f);
+            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.1f, 100f);
         }
 
-        public Matrix4x4[] GetMVPMatrices(Matrix4x4 modelMatrix) // Takes model matrix as parameter
+        public Matrix4x4[] GetMVPMatrices(Matrix4x4 modelMatrix)
         {
             return new Matrix4x4[] { modelMatrix, ViewMatrix, ProjectionMatrix };
         }
