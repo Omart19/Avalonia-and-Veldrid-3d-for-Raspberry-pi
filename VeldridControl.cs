@@ -8,16 +8,82 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
-using System.Text;
 using Veldrid;
 using Veldrid.SPIRV;
 using PixelFormat = Veldrid.PixelFormat;
 using Assimp;
 using Assimp.Configs;
 using Matrix4x4 = System.Numerics.Matrix4x4;
+using System.Text;
+using Vortice.Mathematics;
+using Viewport = Veldrid.Viewport;
+using Point = Avalonia.Point;
 
 namespace VeldridSTLViewer
 {
+
+
+    // -------------------------
+    // Helper Struct for 4 ints.
+    // -------------------------
+    public struct Int4
+    {
+        public int X, Y, Z, W;
+        public Int4(int x, int y, int z, int w)
+        {
+            X = x; Y = y; Z = z; W = w;
+        }
+    }
+
+    // -------------------------
+    // Vertex Structures
+    // -------------------------
+    public struct VertexRigged
+    {
+        // 3 floats for Position, 3 for Normal, 3 for Barycentrics, 4 ints for BoneIndices, 4 floats for BoneWeights.
+        public const uint SizeInBytes = 68;
+        public Vector3 Position;
+        public Vector3 Normal;
+        public Vector3 Barycentrics;
+        public Int4 BoneIndices;
+        public Vector4 BoneWeights;
+        public VertexRigged(Vector3 position, Vector3 normal, Vector3 barycentrics, Int4 boneIndices, Vector4 boneWeights)
+        {
+            Position = position;
+            Normal = normal;
+            Barycentrics = barycentrics;
+            BoneIndices = boneIndices;
+            BoneWeights = boneWeights;
+        }
+    }
+
+    public struct VertexPositionColor
+    {
+        public const uint SizeInBytes = 24;
+        public Vector3 Position;
+        public Vector3 Color;
+        public VertexPositionColor(Vector3 position, Vector3 color)
+        {
+            Position = position;
+            Color = color;
+        }
+    }
+
+    // -------------------------
+    // Model Class
+    // -------------------------
+    public class Model
+    {
+        public DeviceBuffer VertexBuffer { get; set; }
+        public DeviceBuffer IndexBuffer { get; set; }
+        public int VertexCount { get; set; }
+        public int IndexCount { get; set; }
+        public Matrix4x4 Transform { get; set; }
+    }
+
+    // -------------------------
+    // VeldridControl.cs (Main)
+    // -------------------------
     public class VeldridControl : Control
     {
         public static readonly StyledProperty<IBrush> BackgroundProperty =
@@ -28,14 +94,10 @@ namespace VeldridSTLViewer
             set => SetValue(BackgroundProperty, value);
         }
 
-        // Rendering fields.
         private GraphicsDevice _graphicsDevice;
         private CommandList _commandList;
-
-        // List of models loaded from files.
         private List<Model> _models = new List<Model>();
 
-        // We'll use one pipeline for the models (fill+outline via barycentrics).
         private Shader[] _modelShaders;
         private Pipeline _modelPipeline;
 
@@ -49,7 +111,12 @@ namespace VeldridSTLViewer
         private Texture _stagingTexture;
         private bool _resourcesCreated = false;
 
-        // Grid resources.
+        // Bone uniforms.
+        private DeviceBuffer _boneBuffer;
+        private ResourceLayout _boneLayout;
+        private ResourceSet _boneResourceSet;
+
+        // Grid.
         private DeviceBuffer _gridVertexBuffer;
         private DeviceBuffer _gridIndexBuffer;
         private Pipeline _gridPipeline;
@@ -57,17 +124,19 @@ namespace VeldridSTLViewer
         private ResourceLayout _gridResourceLayout;
         private Shader[] _gridShaders;
 
-        // Camera and input.
+        // Camera and Input.
         private CameraController _cameraController;
         private InputState _input = new InputState();
-        private Avalonia.Point _previousMousePosition = new Avalonia.Point(0, 0);
+        private Point _previousMousePosition = new Point(0, 0);
 
-        // --- Shader Code Strings for the model using barycentrics ---
+        // --- Shader Strings ---
         private const string ModelVertexCode = @"
 #version 450
 layout(location = 0) in vec3 Position;
 layout(location = 1) in vec3 Normal;
 layout(location = 2) in vec3 Barycentrics;
+layout(location = 3) in ivec4 BoneIndices;
+layout(location = 4) in vec4 BoneWeights;
 
 layout(location = 0) out vec3 v_Bary;
 layout(location = 1) out vec3 v_Normal;
@@ -79,13 +148,21 @@ layout(set = 0, binding = 0) uniform MVP {
     mat4 Projection;
 };
 
+layout(std140, set = 1, binding = 0) uniform Bones {
+    mat4 BoneMatrices[4];
+};
+
 void main()
 {
-    vec4 worldPosition = Model * vec4(Position, 1.0);
+    mat4 skinMatrix = BoneWeights.x * BoneMatrices[BoneIndices.x] +
+                      BoneWeights.y * BoneMatrices[BoneIndices.y] +
+                      BoneWeights.z * BoneMatrices[BoneIndices.z] +
+                      BoneWeights.w * BoneMatrices[BoneIndices.w];
+    vec4 worldPosition = skinMatrix * vec4(Position, 1.0);
     gl_Position = Projection * View * worldPosition;
     
     v_Bary = Barycentrics;
-    v_Normal = normalize(mat3(Model) * Normal);
+    v_Normal = normalize(mat3(skinMatrix) * Normal);
     v_FragPos = worldPosition.xyz;
 }";
         private const string ModelFragmentCode = @"
@@ -93,14 +170,12 @@ void main()
 layout(location = 0) in vec3 v_Bary;
 layout(location = 1) in vec3 v_Normal;
 layout(location = 2) in vec3 v_FragPos;
-
 layout(location = 0) out vec4 fsout_Color;
 
-// Light properties.
 const vec3 lightPos = vec3(10.0, 10.0, 10.0);
 const vec3 lightColor = vec3(1.0, 1.0, 1.0);
 const vec3 ambientColor = vec3(0.4, 0.4, 0.4);
-const vec3 viewPos = vec3(2.0, 2.0, 2.0);
+const vec3 viewPos = vec3(0, 0, 0);
 const float shininess = 32.0;
 
 void main()
@@ -112,13 +187,13 @@ void main()
     
     vec3 ambient = ambientColor;
     
-    vec3 viewDir = normalize(viewPos - v_FragPos);
+    vec3 viewDir = normalize(viewPos + v_FragPos);
     vec3 reflectDir = reflect(-lightDir, norm);
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
     vec3 specular = spec * lightColor;
     
-    vec3 color = ambient + diffuse + specular;
-    fsout_Color = vec4(color, 1.0);
+    vec3 result = ambient + diffuse + specular;
+    fsout_Color = vec4(result, 1.0);
 }";
         private const string GridVertexCode = @"
 #version 450
@@ -173,12 +248,12 @@ void main()
             DisposeResources();
         }
 
-        // Input event handlers.
+        // Input handlers.
         private void OnPointerMoved(object? sender, PointerEventArgs e)
         {
             if (e != null)
             {
-                Avalonia.Point currentPos = e.GetPosition(this);
+                Point currentPos = e.GetPosition(this);
                 _input.MouseDelta = currentPos - _previousMousePosition;
                 _previousMousePosition = currentPos;
             }
@@ -277,14 +352,19 @@ void main()
             CreateOffscreenFramebuffer();
             _commandList = factory.CreateCommandList();
 
-            // Create uniform buffer for MVP (3 matrices).
+            // Create MVP uniform buffer.
             _mvpBuffer = factory.CreateBuffer(new BufferDescription(3 * 64, BufferUsage.UniformBuffer));
             _mvpLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
                 new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
             _mvpResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_mvpLayout, _mvpBuffer));
 
-            // --- Load multiple models from folder using Assimp ---
-            // Change this folder path as needed.
+            // Create bone uniform buffer.
+            _boneBuffer = factory.CreateBuffer(new BufferDescription(4 * 64, BufferUsage.UniformBuffer));
+            _boneLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription("Bones", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+            _boneResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_boneLayout, _boneBuffer));
+
+            // --- Load models from folder using Assimp ---
             string modelsFolder = @"D:\myscripts\dotnetapplications\VeldridSTLViewer\newarm";
             if (Directory.Exists(modelsFolder))
             {
@@ -298,9 +378,9 @@ void main()
                         Console.WriteLine($"No vertices loaded from {file}. Skipping.");
                         continue;
                     }
-                    // Compute a model matrix for this file so it is centered, scaled, and rotated.
+                    // Compute a model matrix that centers and rotates the model (but does not scale it).
                     Matrix4x4 modelMatrix = ComputeModelMatrix(modelVerts);
-                    DeviceBuffer vertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(modelVerts.Length * VertexPositionNormalBary.SizeInBytes), BufferUsage.VertexBuffer));
+                    DeviceBuffer vertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(modelVerts.Length * VertexRigged.SizeInBytes), BufferUsage.VertexBuffer));
                     _graphicsDevice.UpdateBuffer(vertexBuffer, 0, modelVerts);
                     DeviceBuffer indexBuffer = factory.CreateBuffer(new BufferDescription((uint)(modelIndices.Length * sizeof(ushort)), BufferUsage.IndexBuffer));
                     _graphicsDevice.UpdateBuffer(indexBuffer, 0, modelIndices);
@@ -319,13 +399,14 @@ void main()
             {
                 Console.WriteLine($"Models folder not found: {modelsFolder}");
             }
-            // --- End loading models ---
 
-            // Create model pipeline.
-            VertexLayoutDescription vertexLayout = new VertexLayoutDescription(
+            // Create model pipeline using the rigged vertex layout.
+            VertexLayoutDescription riggedVertexLayout = new VertexLayoutDescription(
                 new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
                 new VertexElementDescription("Normal", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
-                new VertexElementDescription("Barycentrics", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3)
+                new VertexElementDescription("Barycentrics", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+                new VertexElementDescription("BoneIndices", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Int4),
+                new VertexElementDescription("BoneWeights", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float4)
             );
             ShaderDescription modelVSDesc = new ShaderDescription(ShaderStages.Vertex, Encoding.UTF8.GetBytes(ModelVertexCode), "main");
             ShaderDescription modelFSDesc = new ShaderDescription(ShaderStages.Fragment, Encoding.UTF8.GetBytes(ModelFragmentCode), "main");
@@ -345,8 +426,8 @@ void main()
                     comparisonKind: ComparisonKind.LessEqual
                 ),
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
-                ResourceLayouts = new ResourceLayout[] { _mvpLayout },
-                ShaderSet = new ShaderSetDescription(new VertexLayoutDescription[] { vertexLayout }, _modelShaders),
+                ResourceLayouts = new ResourceLayout[] { _mvpLayout, _boneLayout },
+                ShaderSet = new ShaderSetDescription(new VertexLayoutDescription[] { riggedVertexLayout }, _modelShaders),
                 Outputs = _offscreenFramebuffer.OutputDescription
             };
             _modelPipeline = factory.CreateGraphicsPipeline(modelPipelineDesc);
@@ -358,14 +439,17 @@ void main()
             // Initialize camera and input.
             _cameraController = new CameraController((float)Bounds.Width / (float)Bounds.Height);
             _input = new InputState();
-            _cameraController.SetCameraPosition(new Vector3(2f, 2f, 2f));
-            _cameraController.SetCameraRotation(0, 0);
+            // Adjust camera so that the scene (grid and models) are fully visible.
+            // Here we position the camera far back and high.
+            _cameraController.SetCameraPosition(new Vector3(0.5f, 50f, 0.5f));
+            // Set the camera rotation so that it looks horizontally (pitch = 0).
+            _cameraController.SetCameraRotation(0f, 0f);
 
             _resourcesCreated = true;
         }
 
-        // Assimp loader that creates unique barycentrics per triangle.
-        private (VertexPositionNormalBary[] vertices, ushort[] indices) LoadModelWithAssimp(string path)
+        // Assimp loader that produces rigged vertices with default bone data.
+        private (VertexRigged[] vertices, ushort[] indices) LoadModelWithAssimp(string path)
         {
             var importer = new AssimpContext();
             var postProcessSteps = PostProcessSteps.Triangulate |
@@ -381,10 +465,9 @@ void main()
                 if (scene == null || scene.MeshCount == 0)
                     throw new InvalidOperationException("No valid meshes found in file.");
 
-                List<VertexPositionNormalBary> vertexList = new List<VertexPositionNormalBary>();
+                List<VertexRigged> vertexList = new List<VertexRigged>();
                 List<ushort> indexList = new List<ushort>();
 
-                // For each mesh, iterate over faces and create new vertices for each triangle.
                 foreach (var mesh in scene.Meshes)
                 {
                     for (int f = 0; f < mesh.Faces.Count; f++)
@@ -392,8 +475,6 @@ void main()
                         var face = mesh.Faces[f];
                         if (face.Indices.Count != 3)
                             continue;
-
-                        // For each vertex in the face, assign barycentrics based on the vertex order.
                         for (int j = 0; j < 3; j++)
                         {
                             int idx = face.Indices[j];
@@ -406,7 +487,10 @@ void main()
                                 1 => new Vector3(0f, 1f, 0f),
                                 _ => new Vector3(0f, 0f, 1f)
                             };
-                            vertexList.Add(new VertexPositionNormalBary(pos, norm, bary));
+                            // Default bone data: 100% from bone 0.
+                            Int4 boneIndices = new Int4(0, 0, 0, 0);
+                            Vector4 boneWeights = new Vector4(1f, 0f, 0f, 0f);
+                            vertexList.Add(new VertexRigged(pos, norm, bary, boneIndices, boneWeights));
                         }
                         ushort baseIndex = (ushort)(vertexList.Count - 3);
                         indexList.Add(baseIndex);
@@ -420,11 +504,11 @@ void main()
             catch (AssimpException ex)
             {
                 Console.WriteLine($"Error importing {path}: {ex.Message}");
-                return (new VertexPositionNormalBary[0], new ushort[0]);
+                return (new VertexRigged[0], new ushort[0]);
             }
         }
 
-        // (Optional) Existing STL loader remains available.
+        // (Optional) STL loader remains available.
         private (VertexPositionNormalBary[] vertices, ushort[] indices) LoadSTLWithBarycentrics(string path)
         {
             var vertexList = new List<VertexPositionNormalBary>();
@@ -471,8 +555,9 @@ void main()
             return (vertexList.ToArray(), indexList.ToArray());
         }
 
-        // Computes a model matrix that centers, scales, and rotates the model (turning it right side up).
-        private Matrix4x4 ComputeModelMatrix(VertexPositionNormalBary[] vertices)
+        // Compute a model matrix for rigged vertices that centers and rotates the model right side up.
+        // In this version, we do NOT apply additional scaling so the model remains at its imported size.
+        private Matrix4x4 ComputeModelMatrix(VertexRigged[] vertices)
         {
             if (vertices.Length == 0)
                 return Matrix4x4.Identity;
@@ -494,7 +579,7 @@ void main()
             Matrix4x4 translation = Matrix4x4.CreateTranslation(-center);
             Matrix4x4 scale = Matrix4x4.CreateScale(scaleFactor);
             // Rotate -90° about the X-axis to turn the model right side up.
-            Matrix4x4 rotation = Matrix4x4.CreateRotationX(-MathF.PI / 2);
+            Matrix4x4 rotation = Matrix4x4.CreateRotationX(MathF.PI / 2);
             return rotation * (translation * scale);
         }
 
@@ -541,16 +626,15 @@ void main()
         private void CreateGridResources()
         {
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
-            // Create a larger grid spanning from -40 to +40 and placed at y = -0.1.
+            // Create a larger grid spanning from -80 to +80 on X and Z, placed at y = -0.1.
             VertexPositionColor[] gridVertices = new VertexPositionColor[]
             {
-                new VertexPositionColor(new Vector3(-40f, -0.1f, -40f), new Vector3(0.5f, 0.5f, 0.5f)),
-                new VertexPositionColor(new Vector3(40f, -0.1f, -40f), new Vector3(0.5f, 0.5f, 0.5f)),
-                new VertexPositionColor(new Vector3(40f, -0.1f, 40f), new Vector3(0.5f, 0.5f, 0.5f)),
-                new VertexPositionColor(new Vector3(-40f, -0.1f, 40f), new Vector3(0.5f, 0.5f, 0.5f))
+                new VertexPositionColor(new Vector3(-80f, -0.1f, -80f), new Vector3(0.5f,0.5f,0.5f)),
+                new VertexPositionColor(new Vector3(80f, -0.1f, -80f), new Vector3(0.5f,0.5f,0.5f)),
+                new VertexPositionColor(new Vector3(80f, -0.1f, 80f), new Vector3(0.5f,0.5f,0.5f)),
+                new VertexPositionColor(new Vector3(-80f, -0.1f, 80f), new Vector3(0.5f,0.5f,0.5f))
             };
 
-            // Draw the border of the grid.
             ushort[] gridIndices = new ushort[]
             {
                 0,1, 1,2, 2,3, 3,0
@@ -593,12 +677,21 @@ void main()
             _gridPipeline = factory.CreateGraphicsPipeline(gridPipelineDesc);
         }
 
-        // Update the MVP using the CameraController.
+        // Update the MVP and bone uniform buffers.
         private void UpdateMVP()
         {
             _cameraController.Update(0.016f, _input);
-            Matrix4x4[] mvp = _cameraController.GetMVPMatrices(_models.Count > 0 ? _models[0].Transform : Matrix4x4.Identity);
+            // For models, use their individual transform.
+            // For the grid, we use identity.
+            Matrix4x4[] mvp = _cameraController.GetMVPMatrices(
+                _models.Count > 0 ? _models[0].Transform : Matrix4x4.Identity);
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvp);
+
+            // For now, set all bone matrices to identity.
+            Matrix4x4[] boneMatrices = new Matrix4x4[4];
+            for (int i = 0; i < 4; i++)
+                boneMatrices[i] = Matrix4x4.Identity;
+            _graphicsDevice.UpdateBuffer(_boneBuffer, 0, boneMatrices);
         }
 
         public override void Render(Avalonia.Media.DrawingContext context)
@@ -635,23 +728,28 @@ void main()
 
             _commandList.Begin();
             _commandList.SetFramebuffer(_offscreenFramebuffer);
-            _commandList.ClearColorTarget(0, new RgbaFloat(0, 0, 0, 1));  // Clear to black.
+            _commandList.ClearColorTarget(0, new RgbaFloat(0, 0, 0, 1));
             _commandList.ClearDepthStencil(1f);
-            _commandList.SetViewport(0, new Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
+            _commandList.SetViewport(0, new Veldrid.Viewport(0, 0, (float)Bounds.Width, (float)Bounds.Height, 0, 1));
             _commandList.SetScissorRect(0, 0, 0, (uint)Bounds.Width, (uint)Bounds.Height);
 
-            // Draw grid.
+            // --- Draw grid with identity transform ---
+            Matrix4x4[] gridMVP = _cameraController.GetMVPMatrices(Matrix4x4.Identity);
+            _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, gridMVP);
             _commandList.SetPipeline(_gridPipeline);
             _commandList.SetGraphicsResourceSet(0, _mvpResourceSet);
             _commandList.SetVertexBuffer(0, _gridVertexBuffer);
             _commandList.SetIndexBuffer(_gridIndexBuffer, IndexFormat.UInt16);
             _commandList.DrawIndexed((uint)(_gridIndexBuffer.SizeInBytes / sizeof(ushort)), 1, 0, 0, 0);
 
-            // Draw each loaded model.
+            // --- Draw each model using its own transform ---
             foreach (var model in _models)
             {
+                Matrix4x4[] modelMVP = _cameraController.GetMVPMatrices(model.Transform);
+                _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, modelMVP);
                 _commandList.SetPipeline(_modelPipeline);
                 _commandList.SetGraphicsResourceSet(0, _mvpResourceSet);
+                _commandList.SetGraphicsResourceSet(1, _boneResourceSet);
                 _commandList.SetVertexBuffer(0, model.VertexBuffer);
                 _commandList.SetIndexBuffer(model.IndexBuffer, IndexFormat.UInt16);
                 _commandList.DrawIndexed((uint)model.IndexCount, 1, 0, 0, 0);
@@ -681,6 +779,9 @@ void main()
             _mvpBuffer?.Dispose();
             _mvpResourceSet?.Dispose();
             _mvpLayout?.Dispose();
+            _boneBuffer?.Dispose();
+            _boneResourceSet?.Dispose();
+            _boneLayout?.Dispose();
             _offscreenFramebuffer?.Dispose();
             _offscreenColorTexture?.Dispose();
             _offscreenDepthTexture?.Dispose();
@@ -700,10 +801,12 @@ void main()
         }
     }
 
-    // Vertex structure with barycentrics.
+    // -------------------------
+    // Unrigged Vertex Structure (for reference)
+    // -------------------------
     public struct VertexPositionNormalBary
     {
-        public const uint SizeInBytes = 36; // 3 floats each for Position, Normal, Barycentrics.
+        public const uint SizeInBytes = 36;
         public Vector3 Position;
         public Vector3 Normal;
         public Vector3 Barycentrics;
@@ -713,28 +816,5 @@ void main()
             Normal = normal;
             Barycentrics = barycentrics;
         }
-    }
-
-    // Vertex structure for grid.
-    public struct VertexPositionColor
-    {
-        public const uint SizeInBytes = 24; // 3 floats each for Position and Color.
-        public Vector3 Position;
-        public Vector3 Color;
-        public VertexPositionColor(Vector3 position, Vector3 color)
-        {
-            Position = position;
-            Color = color;
-        }
-    }
-
-    // Simple model class.
-    public class Model
-    {
-        public DeviceBuffer VertexBuffer { get; set; }
-        public DeviceBuffer IndexBuffer { get; set; }
-        public int VertexCount { get; set; }
-        public int IndexCount { get; set; }
-        public Matrix4x4 Transform { get; set; }
     }
 }

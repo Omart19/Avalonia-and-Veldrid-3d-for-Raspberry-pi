@@ -1,13 +1,9 @@
-﻿//CameraController.cs
-using System;
+﻿using Avalonia.Input;
 using System.Numerics;
-using Avalonia.Input; // For Key and Pointer events
+using VeldridSTLViewer;
 
 namespace VeldridSTLViewer
 {
-    //=================================================================
-    // CameraController.cs (your provided version)
-    //=================================================================
     public class CameraController
     {
         public Matrix4x4 ViewMatrix { get; private set; } = Matrix4x4.Identity;
@@ -15,7 +11,7 @@ namespace VeldridSTLViewer
         private Vector3 _cameraPosition = new Vector3(0, 0, 5);
         private float _yaw = 0f;
         private float _pitch = 0f;
-        private float _moveSpeed = 2.0f;
+        private float _moveSpeed = 10.0f;
         private float _rotationSpeed = 0.01f;
         private float _aspectRatio;
         public CameraController(float aspectRatio)
@@ -51,7 +47,8 @@ namespace VeldridSTLViewer
             {
                 _yaw += (float)input.MouseDelta.X * _rotationSpeed;
                 _pitch -= (float)input.MouseDelta.Y * _rotationSpeed;
-                _pitch = Math.Clamp(_pitch, -MathF.PI / 2f, MathF.PI / 2f);
+                _pitch = Math.Clamp(_pitch, -MathF.PI / 1f, MathF.PI / 1f);
+                // Optionally, clamp pitch here if desired.
             }
             UpdateViewMatrix();
         }
@@ -62,14 +59,18 @@ namespace VeldridSTLViewer
         }
         private void UpdateViewMatrix()
         {
+            // Compute forward direction.
             var rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
-            Vector3 cameraTarget = _cameraPosition + Vector3.Transform(-Vector3.UnitZ, rotation);
+            Vector3 forward = Vector3.Transform(-Vector3.UnitZ, rotation);
+            Vector3 cameraTarget = _cameraPosition + forward;
+            // FIX: Always use world up.
             Vector3 cameraUp = Vector3.Transform(Vector3.UnitY, rotation);
             ViewMatrix = Matrix4x4.CreateLookAt(_cameraPosition, cameraTarget, cameraUp);
         }
         private void UpdateProjectionMatrix()
         {
-            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.1f, 100f);
+            // Use a 60° FOV and far clip of 1000.
+            ProjectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(MathF.PI / 4, _aspectRatio, 0.5f, 1000f);
         }
         public Matrix4x4[] GetMVPMatrices(Matrix4x4 modelMatrix)
         {
