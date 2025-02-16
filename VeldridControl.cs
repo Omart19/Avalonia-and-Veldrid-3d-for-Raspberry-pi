@@ -441,9 +441,9 @@ void main()
             _input = new InputState();
             // Adjust camera so that the scene (grid and models) are fully visible.
             // Here we position the camera far back and high.
-            _cameraController.SetCameraPosition(new Vector3(0.5f, 50f, 0.5f));
+            _cameraController.SetCameraPosition(new Vector3(-410.9203f, 561.13007f, 398.45343f));
             // Set the camera rotation so that it looks horizontally (pitch = 0).
-            _cameraController.SetCameraRotation(0f, 0f);
+            _cameraController.SetCameraRotation(0f, 0.29327f);
 
             _resourcesCreated = true;
         }
@@ -714,6 +714,7 @@ void main()
                     }
                     _graphicsDevice.Unmap(_stagingTexture);
                 }
+                //Console.WriteLine($"{_cameraController}");
                 context.DrawImage(_avaloniaBitmap, new Rect(0, 0, Bounds.Width, Bounds.Height));
                 base.Render(context);
             }, DispatcherPriority.Render);

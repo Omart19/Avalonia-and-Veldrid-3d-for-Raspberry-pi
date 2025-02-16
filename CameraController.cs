@@ -11,7 +11,7 @@ namespace VeldridSTLViewer
         private Vector3 _cameraPosition = new Vector3(0, 0, 5);
         private float _yaw = 0f;
         private float _pitch = 0f;
-        private float _moveSpeed = 10.0f;
+        private float _moveSpeed = 40.0f;
         private float _rotationSpeed = 0.01f;
         private float _aspectRatio;
         public CameraController(float aspectRatio)
@@ -36,18 +36,18 @@ namespace VeldridSTLViewer
             float deltaSeconds = (float)deltaTime;
             Matrix4x4 rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
             if (input.IsKeyDown(Key.W))
-                _cameraPosition += Vector3.Transform(-Vector3.UnitZ, rotation) * _moveSpeed * deltaSeconds;
+                _cameraPosition += Vector3.Transform(-Vector3.UnitY, rotation) * _moveSpeed * deltaSeconds;
             if (input.IsKeyDown(Key.S))
-                _cameraPosition += Vector3.Transform(Vector3.UnitZ, rotation) * _moveSpeed * deltaSeconds;
+                _cameraPosition += Vector3.Transform(Vector3.UnitY, rotation) * _moveSpeed * deltaSeconds;
             if (input.IsKeyDown(Key.A))
-                _cameraPosition += Vector3.Transform(-Vector3.UnitX, rotation) * _moveSpeed * deltaSeconds;
-            if (input.IsKeyDown(Key.D))
                 _cameraPosition += Vector3.Transform(Vector3.UnitX, rotation) * _moveSpeed * deltaSeconds;
+            if (input.IsKeyDown(Key.D))
+                _cameraPosition += Vector3.Transform(-Vector3.UnitX, rotation) * _moveSpeed * deltaSeconds;
             if (input.IsMouseDown(MouseButton.Left))
             {
                 _yaw += (float)input.MouseDelta.X * _rotationSpeed;
                 _pitch -= (float)input.MouseDelta.Y * _rotationSpeed;
-                _pitch = Math.Clamp(_pitch, -MathF.PI / 1f, MathF.PI / 1f);
+                _pitch = Math.Clamp(_pitch, -MathF.PI / 2f, MathF.PI / 2f);
                 // Optionally, clamp pitch here if desired.
             }
             UpdateViewMatrix();
@@ -60,12 +60,13 @@ namespace VeldridSTLViewer
         private void UpdateViewMatrix()
         {
             // Compute forward direction.
-            var rotation = Matrix4x4.CreateFromYawPitchRoll(_yaw, _pitch, 0);
-            Vector3 forward = Vector3.Transform(-Vector3.UnitZ, rotation);
+            var rotation = Matrix4x4.CreateFromYawPitchRoll(0, _pitch, _yaw);
+            Vector3 forward = Vector3.Transform(-Vector3.UnitY, rotation);
             Vector3 cameraTarget = _cameraPosition + forward;
             // FIX: Always use world up.
-            Vector3 cameraUp = Vector3.Transform(Vector3.UnitY, rotation);
+            Vector3 cameraUp = Vector3.Transform(Vector3.UnitZ, rotation);
             ViewMatrix = Matrix4x4.CreateLookAt(_cameraPosition, cameraTarget, cameraUp);
+            Console.WriteLine($"CameraPosition :{_cameraPosition} CameraTarget :{cameraTarget} CameraUp :{cameraUp}");
         }
         private void UpdateProjectionMatrix()
         {
