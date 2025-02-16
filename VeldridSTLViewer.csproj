@@ -17,6 +17,12 @@
     <AvaloniaXamlReportImportance>Normal</AvaloniaXamlReportImportance>
   </PropertyGroup>
 
+	<ItemGroup>
+		<Content Include="newarm\**">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="AssimpNet" Version="4.1.0" />
     <PackageReference Include="Avalonia" Version="11.2.1" />

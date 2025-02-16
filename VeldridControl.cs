@@ -18,6 +18,7 @@ using System.Text;
 using Vortice.Mathematics;
 using Viewport = Veldrid.Viewport;
 using Point = Avalonia.Point;
+using System.Reflection;
 
 namespace VeldridSTLViewer
 {
@@ -301,7 +302,7 @@ void main()
                     PreferDepthRangeZeroToOne = true,
                     SyncToVerticalBlank = true,
                     ResourceBindingModel = ResourceBindingModel.Default,
-                    SwapchainDepthFormat = PixelFormat.R32_G32_B32_A32_Float,
+                    SwapchainDepthFormat = PixelFormat.B8_G8_R8_A8_UNorm,
                     Debug = true
                 };
                 _graphicsDevice = GraphicsDevice.CreateVulkan(options);
@@ -365,10 +366,14 @@ void main()
             _boneResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_boneLayout, _boneBuffer));
 
             // --- Load models from folder using Assimp ---
-            string modelsFolder = @"D:\myscripts\dotnetapplications\VeldridSTLViewer\newarm";
+            // Get the directory where the executing assembly (your .exe) is located.
+            string assemblyPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+
+            // Construct the full path to the "newarm" folder.
+            string modelsFolder = Path.Combine(assemblyPath, "newarm");
             if (Directory.Exists(modelsFolder))
             {
-                string[] modelFiles = Directory.GetFiles(modelsFolder, "*.*", SearchOption.AllDirectories);
+                string[] modelFiles = Directory.GetFiles(modelsFolder, "*.*");
                 Console.WriteLine($"Found {modelFiles.Length} model files in folder: {modelsFolder}");
                 foreach (var file in modelFiles)
                 {
@@ -596,7 +601,7 @@ void main()
 
         private void CreateAvaloniaBitmap()
         {
-            var pixelFormat = Avalonia.Platform.PixelFormat.Rgb32;
+            var pixelFormat = Avalonia.Platform.PixelFormat.Rgba8888;
             var alphaFormat = Avalonia.Platform.AlphaFormat.Premul;
             _avaloniaBitmap = new WriteableBitmap(
                 new Avalonia.PixelSize((int)Math.Max(1, Bounds.Width), (int)Math.Max(1, Bounds.Height)),
@@ -618,7 +623,7 @@ void main()
                 (uint)Math.Max(1, Bounds.Width),
                 (uint)Math.Max(1, Bounds.Height),
                 1, 1,
-                PixelFormat.D32_Float_S8_UInt,
+                PixelFormat.D24_UNorm_S8_UInt,
                 TextureUsage.DepthStencil));
             _offscreenFramebuffer = factory.CreateFramebuffer(new FramebufferDescription(_offscreenDepthTexture, _offscreenColorTexture));
         }
