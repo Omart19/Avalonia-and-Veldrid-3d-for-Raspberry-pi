@@ -19,6 +19,17 @@ using Vortice.Mathematics;
 using Viewport = Veldrid.Viewport;
 using Point = Avalonia.Point;
 using System.Reflection;
+using Veldrid.MetalBindings;
+using SharpGLTF.Schema2;
+using SharpGLTF.Transforms;
+using SharpGLTF.IO; // For ModelRoot.ReadGLB
+using System.Linq;
+using Texture = Veldrid.Texture;
+using Buffer = System.Buffer;
+using Node = SharpGLTF.Schema2.Node;
+using ReactiveUI;
+using Tmds.DBus.Protocol;
+using System.Reflection.PortableExecutable;
 
 namespace VeldridSTLViewer
 {
@@ -80,6 +91,11 @@ namespace VeldridSTLViewer
         public int VertexCount { get; set; }
         public int IndexCount { get; set; }
         public Matrix4x4 Transform { get; set; }
+
+        // Additional information for bone grouping:
+        public string Name { get; set; }
+        public int BoneIndex { get; set; }  // 0 = base, 1 = upperarm, 2 = forearm, etc.
+        public Vector3 Center { get; set; } // Computed center of the model's vertices (in world space, after applying Transform)
     }
 
     // -------------------------
@@ -107,7 +123,7 @@ namespace VeldridSTLViewer
         private ResourceSet _mvpResourceSet;
         private WriteableBitmap _avaloniaBitmap;
         private Framebuffer _offscreenFramebuffer;
-        private Texture _offscreenColorTexture;
+        private Veldrid.Texture _offscreenColorTexture;
         private Texture _offscreenDepthTexture;
         private Texture _stagingTexture;
         private bool _resourcesCreated = false;
@@ -116,6 +132,31 @@ namespace VeldridSTLViewer
         private DeviceBuffer _boneBuffer;
         private ResourceLayout _boneLayout;
         private ResourceSet _boneResourceSet;
+        private ModelRoot _cachedModelRoot;
+        private Skin _cachedSkin;
+
+        private Dictionary<string, int> _boneMapping;
+
+        private void CacheModelData(string gltfPath)
+        {
+            _cachedModelRoot = ModelRoot.Load(gltfPath);
+            _cachedSkin = _cachedModelRoot.LogicalSkins.FirstOrDefault();
+            if (_cachedSkin == null)
+            {
+                Console.WriteLine("No skin data found in model.");
+            }
+            else
+            {
+                // Build the mapping.
+                _boneMapping = new Dictionary<string, int>();
+                for (int i = 0; i < _cachedSkin.Joints.Count; i++)
+                {
+                    // Lowercase the bone name so you can compare case–insensitively.
+                    string boneName = _cachedSkin.Joints[i].Name.ToLower();
+                    _boneMapping[boneName] = i;
+                }
+            }
+        }
 
         // Grid.
         private DeviceBuffer _gridVertexBuffer;
@@ -133,6 +174,7 @@ namespace VeldridSTLViewer
         // --- Shader Strings ---
         private const string ModelVertexCode = @"
 #version 450
+
 layout(location = 0) in vec3 Position;
 layout(location = 1) in vec3 Normal;
 layout(location = 2) in vec3 Barycentrics;
@@ -144,30 +186,36 @@ layout(location = 1) out vec3 v_Normal;
 layout(location = 2) out vec3 v_FragPos;
 
 layout(set = 0, binding = 0) uniform MVP {
+    // For skeletal meshes, the CPU should pass in Model = Identity.
     mat4 Model;
     mat4 View;
     mat4 Projection;
 };
 
 layout(std140, set = 1, binding = 0) uniform Bones {
-    mat4 BoneMatrices[4];
+    mat4 BoneMatrices[15];
 };
 
 void main()
 {
+    // Compute the skinning matrix – if the mesh is skinned this matters;
+    // for non–skinned meshes (which you want to follow a bone) the CPU must have left the vertices in bind–pose.
     mat4 skinMatrix = BoneWeights.x * BoneMatrices[BoneIndices.x] +
                       BoneWeights.y * BoneMatrices[BoneIndices.y] +
                       BoneWeights.z * BoneMatrices[BoneIndices.z] +
                       BoneWeights.w * BoneMatrices[BoneIndices.w];
-    vec4 worldPosition = skinMatrix * vec4(Position, 1.0);
+
+    vec4 worldPosition = Model * (skinMatrix * vec4(Position, 1.0));
     gl_Position = Projection * View * worldPosition;
-    
+
     v_Bary = Barycentrics;
     v_Normal = normalize(mat3(skinMatrix) * Normal);
     v_FragPos = worldPosition.xyz;
-}";
+}
+";
         private const string ModelFragmentCode = @"
 #version 450
+
 layout(location = 0) in vec3 v_Bary;
 layout(location = 1) in vec3 v_Normal;
 layout(location = 2) in vec3 v_FragPos;
@@ -185,16 +233,15 @@ void main()
     vec3 lightDir = normalize(lightPos - v_FragPos);
     float diff = max(dot(norm, lightDir), 0.0);
     vec3 diffuse = diff * lightColor;
-    
+
     vec3 ambient = ambientColor;
-    
-    vec3 viewDir = normalize(viewPos + v_FragPos);
+
+    vec3 viewDir = normalize(viewPos - v_FragPos);
     vec3 reflectDir = reflect(-lightDir, norm);
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
     vec3 specular = spec * lightColor;
-    
-    vec3 result = ambient + diffuse + specular;
-    fsout_Color = vec4(result, 1.0);
+
+    fsout_Color = vec4(ambient + diffuse + specular, 1.0);
 }";
         private const string GridVertexCode = @"
 #version 450
@@ -354,13 +401,13 @@ void main()
             _commandList = factory.CreateCommandList();
 
             // Create MVP uniform buffer.
-            _mvpBuffer = factory.CreateBuffer(new BufferDescription(3 * 64, BufferUsage.UniformBuffer));
+            _mvpBuffer = factory.CreateBuffer(new BufferDescription(16 * 64, BufferUsage.UniformBuffer));
             _mvpLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
                 new ResourceLayoutElementDescription("MVP", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
             _mvpResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_mvpLayout, _mvpBuffer));
 
             // Create bone uniform buffer.
-            _boneBuffer = factory.CreateBuffer(new BufferDescription(4 * 64, BufferUsage.UniformBuffer));
+            _boneBuffer = factory.CreateBuffer(new BufferDescription(16 * 64, BufferUsage.UniformBuffer));
             _boneLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
                 new ResourceLayoutElementDescription("Bones", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
             _boneResourceSet = factory.CreateResourceSet(new ResourceSetDescription(_boneLayout, _boneBuffer));
@@ -371,39 +418,38 @@ void main()
 
             // Construct the full path to the "newarm" folder.
             string modelsFolder = Path.Combine(assemblyPath, "newarm");
+            int boneIndex = 0; // default is "base"
             if (Directory.Exists(modelsFolder))
             {
-                string[] modelFiles = Directory.GetFiles(modelsFolder, "*.*");
-                Console.WriteLine($"Found {modelFiles.Length} model files in folder: {modelsFolder}");
-                foreach (var file in modelFiles)
+                // In CreateResources (or similar initialization routine)
+                string robotArmPath = Path.Combine(modelsFolder, "robotarm.glb");
+                if (File.Exists(robotArmPath))
                 {
-                    var (modelVerts, modelIndices) = LoadModelWithAssimp(file);
-                    if (modelVerts.Length == 0)
+                    CacheModelData(robotArmPath);
+                    var loadedModels = LoadGLTFModelsFromModelRoot(_cachedModelRoot, 0);
+                    foreach (var m in loadedModels)
                     {
-                        Console.WriteLine($"No vertices loaded from {file}. Skipping.");
-                        continue;
+                        _models.Add(m);
                     }
-                    // Compute a model matrix that centers and rotates the model (but does not scale it).
-                    Matrix4x4 modelMatrix = ComputeModelMatrix(modelVerts);
-                    DeviceBuffer vertexBuffer = factory.CreateBuffer(new BufferDescription((uint)(modelVerts.Length * VertexRigged.SizeInBytes), BufferUsage.VertexBuffer));
-                    _graphicsDevice.UpdateBuffer(vertexBuffer, 0, modelVerts);
-                    DeviceBuffer indexBuffer = factory.CreateBuffer(new BufferDescription((uint)(modelIndices.Length * sizeof(ushort)), BufferUsage.IndexBuffer));
-                    _graphicsDevice.UpdateBuffer(indexBuffer, 0, modelIndices);
-                    _models.Add(new Model
+                    Matrix4x4[] boneTransforms = ComputeBoneTransforms(_cachedModelRoot);
+                    if (boneTransforms.Length > 0)
                     {
-                        VertexBuffer = vertexBuffer,
-                        IndexBuffer = indexBuffer,
-                        VertexCount = modelVerts.Length,
-                        IndexCount = modelIndices.Length,
-                        Transform = modelMatrix
-                    });
+                        _graphicsDevice.UpdateBuffer(_boneBuffer, 0, boneTransforms);
+                        Console.WriteLine($"Updated bone buffer with {boneTransforms.Length} bone matrices.");
+                    }
                 }
-                Console.WriteLine($"Loaded {_models.Count} models.");
+
+
+                else
+                {
+                    Console.WriteLine($"robotarm.gltf not found in {modelsFolder}");
+                }
             }
             else
             {
                 Console.WriteLine($"Models folder not found: {modelsFolder}");
             }
+
 
             // Create model pipeline using the rigged vertex layout.
             VertexLayoutDescription riggedVertexLayout = new VertexLayoutDescription(
@@ -446,146 +492,266 @@ void main()
             _input = new InputState();
             // Adjust camera so that the scene (grid and models) are fully visible.
             // Here we position the camera far back and high.
-            _cameraController.SetCameraPosition(new Vector3(-410.9203f, 561.13007f, 398.45343f));
+            _cameraController.SetCameraPosition(new Vector3(-558.46857f, 411.7341f, 413.71497f));
             // Set the camera rotation so that it looks horizontally (pitch = 0).
-            _cameraController.SetCameraRotation(0f, 0.29327f);
+            _cameraController.SetCameraRotation(2.8599985f, -0.23999998f);
 
             _resourcesCreated = true;
         }
 
-        // Assimp loader that produces rigged vertices with default bone data.
-        private (VertexRigged[] vertices, ushort[] indices) LoadModelWithAssimp(string path)
+
+
+
+        //private Matrix4x4 ComputeWorldTransform(Node node)
+        //{
+        //    // Use the matrix provided by SharpGLTF.
+        //    Matrix4x4 local = (Matrix4x4)node.LocalTransform.Matrix;
+        //    if (node.LogicalParent == null || !(node.LogicalParent is Node))
+        //        return local;
+        //    Node parentNode = (Node)(object)node.LogicalParent;
+        //    return ComputeWorldTransform(parentNode) * local;
+        //}
+
+
+
+        private Matrix4x4[] ComputeBoneTransforms(ModelRoot model)
         {
-            var importer = new AssimpContext();
-            var postProcessSteps = PostProcessSteps.Triangulate |
-                                   PostProcessSteps.GenerateSmoothNormals |
-                                   PostProcessSteps.JoinIdenticalVertices |
-                                   PostProcessSteps.FixInFacingNormals |
-                                   PostProcessSteps.ImproveCacheLocality |
-                                   PostProcessSteps.OptimizeMeshes |
-                                   PostProcessSteps.CalculateTangentSpace;
-            try
+            var skin = model.LogicalSkins.FirstOrDefault();
+            if (skin == null)
             {
-                var scene = importer.ImportFile(path, postProcessSteps);
-                if (scene == null || scene.MeshCount == 0)
-                    throw new InvalidOperationException("No valid meshes found in file.");
+                Console.WriteLine("No skin found in model.");
+                return new Matrix4x4[0];
+            }
 
-                List<VertexRigged> vertexList = new List<VertexRigged>();
-                List<ushort> indexList = new List<ushort>();
+            int count = skin.Joints.Count;
+            Matrix4x4[] boneTransforms = new Matrix4x4[count];
 
-                foreach (var mesh in scene.Meshes)
+            for (int i = 0; i < count; i++)
+            {
+                boneTransforms[i] = GetBoneFinalTransform(i);
+            }
+
+            return boneTransforms;
+        }
+
+
+
+        /// <summary>
+        /// Loads a glTF file and creates one “master” Model (i.e. GPU buffers) for each unique mesh primitive.
+        /// For every node that references that same primitive, a new Model instance is created that
+        /// reuses the buffers (so you don’t duplicate geometry in GPU memory) but gets its own world transform.
+        /// </summary>
+
+        // Helper: Returns the bone index to assign based on the node's name.
+        // Helper: Returns the bone index to assign based on the node's name.
+        private int GetAssignedBoneIndex(string nodeName)
+        {
+            string lowerName = nodeName.ToLower();
+            int boneIdx = 0; // default fallback
+
+            // Adjust these string comparisons to match your actual bone names.
+            if (lowerName.Contains("groundbase"))
+            {
+                if (_boneMapping.TryGetValue("baseabovebone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("camerahorizontalmovement"))
+            {
+                if (_boneMapping.TryGetValue("cameraleftrightrotation", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("cameravirticalmovement"))
+            {
+                if (_boneMapping.TryGetValue("camerapivotupdownbone", out int idx))
+                    boneIdx = idx;
+            }
+            // Second branch: the arm ladder.
+            else if (lowerName.Contains("rotatorbase"))
+            {
+                if (_boneMapping.TryGetValue("rotatorbasebone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("lowerarm"))
+            {
+                if (_boneMapping.TryGetValue("lowerarmlowerbone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("middlearm"))
+            {
+                if (_boneMapping.TryGetValue("upperarmlowerbone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("rotatorwrist") ||
+                     lowerName.Contains("rwgripperrotatorjoint"))
+            {
+                if (_boneMapping.TryGetValue("wristbone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("lefthandgripper"))
+            {
+                if (_boneMapping.TryGetValue("leftgripbone", out int idx))
+                    boneIdx = idx;
+            }
+            else if (lowerName.Contains("righthandgripper"))
+            {
+                if (_boneMapping.TryGetValue("rightgripbone", out int idx))
+                    boneIdx = idx;
+            }
+
+            return boneIdx;
+        }
+
+        // Updated LoadGLTFModelsFromModelRoot:
+        private List<Model> LoadGLTFModelsFromModelRoot(ModelRoot modelRoot, int defaultBoneIndex)
+        {
+            var models = new List<Model>();
+            var loadedPrimitives = new Dictionary<(SharpGLTF.Schema2.Mesh, int), (DeviceBuffer vb, DeviceBuffer ib, int vertexCount, int indexCount)>();
+
+            Console.WriteLine($"ModelRoot loaded. Scenes: {modelRoot.LogicalScenes.Count}, Skins: {modelRoot.LogicalSkins.Count()}");
+
+            Vector3 ComputeCenter(VertexRigged[] vertices)
+            {
+                Vector3 min = new Vector3(float.MaxValue);
+                Vector3 max = new Vector3(float.MinValue);
+                foreach (var v in vertices)
                 {
-                    for (int f = 0; f < mesh.Faces.Count; f++)
+                    min = Vector3.Min(min, v.Position);
+                    max = Vector3.Max(max, v.Position);
+                }
+                return (min + max) / 2;
+            }
+
+            void ProcessNode(Node node)
+            {
+                Console.WriteLine($"Processing Node: {node.Name}");
+                Console.WriteLine($" - WorldMatrix first row: {node.WorldMatrix.M11}, {node.WorldMatrix.M12}, {node.WorldMatrix.M13}, {node.WorldMatrix.M14}");
+
+                Matrix4x4 world = node.WorldMatrix;
+
+                if (node.Mesh != null)
+                {
+                    Console.WriteLine($" - Mesh present. Primitives count: {node.Mesh.Primitives.Count}");
+                    int assignedBoneIndex = GetAssignedBoneIndex(node.Name);
+
+                    for (int primIndex = 0; primIndex < node.Mesh.Primitives.Count; primIndex++)
                     {
-                        var face = mesh.Faces[f];
-                        if (face.Indices.Count != 3)
-                            continue;
-                        for (int j = 0; j < 3; j++)
+                        var primitive = node.Mesh.Primitives[primIndex];
+                        var key = (node.Mesh, primIndex);
+                        if (!loadedPrimitives.TryGetValue(key, out var buffers))
                         {
-                            int idx = face.Indices[j];
-                            var vertex = mesh.Vertices[idx];
-                            Vector3 pos = new Vector3(vertex.X, vertex.Y, vertex.Z);
-                            Vector3 norm = mesh.HasNormals ? new Vector3(mesh.Normals[idx].X, mesh.Normals[idx].Y, mesh.Normals[idx].Z) : Vector3.UnitZ;
-                            Vector3 bary = j switch
+                            Vector3[] positions = primitive.VertexAccessors["POSITION"].AsVector3Array().ToArray();
+                            Vector3[] normals = primitive.VertexAccessors["NORMAL"].AsVector3Array().ToArray();
+
+                            ushort[] primIndices = (primitive.IndexAccessor != null)
+                                ? primitive.IndexAccessor.AsIndicesArray().Select(x => (ushort)x).ToArray()
+                                : Enumerable.Range(0, positions.Length).Select(i => (ushort)i).ToArray();
+
+                            bool hasJoints = primitive.VertexAccessors.ContainsKey("JOINTS_0");
+                            bool hasWeights = primitive.VertexAccessors.ContainsKey("WEIGHTS_0");
+                            Console.WriteLine($" Primitive {primIndex}: HasJoints: {hasJoints}, HasWeights: {hasWeights}");
+
+                            int vertexCountLocal = positions.Length;
+                            int[][] jointsData = null;
+                            float[][] weightsData = null;
+                            if (hasJoints && hasWeights)
                             {
-                                0 => new Vector3(1f, 0f, 0f),
-                                1 => new Vector3(0f, 1f, 0f),
-                                _ => new Vector3(0f, 0f, 1f)
-                            };
-                            // Default bone data: 100% from bone 0.
-                            Int4 boneIndices = new Int4(0, 0, 0, 0);
-                            Vector4 boneWeights = new Vector4(1f, 0f, 0f, 0f);
-                            vertexList.Add(new VertexRigged(pos, norm, bary, boneIndices, boneWeights));
-                        }
-                        ushort baseIndex = (ushort)(vertexList.Count - 3);
-                        indexList.Add(baseIndex);
-                        indexList.Add((ushort)(baseIndex + 1));
-                        indexList.Add((ushort)(baseIndex + 2));
-                    }
-                }
-                Console.WriteLine($"Assimp: Loaded {vertexList.Count} vertices from {Path.GetFileName(path)}");
-                return (vertexList.ToArray(), indexList.ToArray());
-            }
-            catch (AssimpException ex)
-            {
-                Console.WriteLine($"Error importing {path}: {ex.Message}");
-                return (new VertexRigged[0], new ushort[0]);
-            }
-        }
+                                jointsData = primitive.VertexAccessors["JOINTS_0"]
+                                    .AsVector4Array()
+                                    .Select(v => new int[] { (int)v.X, (int)v.Y, (int)v.Z, (int)v.W })
+                                    .ToArray();
+                                weightsData = primitive.VertexAccessors["WEIGHTS_0"]
+                                    .AsVector4Array()
+                                    .Select(v => new float[] { v.X, v.Y, v.Z, v.W })
+                                    .ToArray();
+                            }
 
-        // (Optional) STL loader remains available.
-        private (VertexPositionNormalBary[] vertices, ushort[] indices) LoadSTLWithBarycentrics(string path)
-        {
-            var vertexList = new List<VertexPositionNormalBary>();
-            var indexList = new List<ushort>();
-            try
-            {
-                using (BinaryReader reader = new BinaryReader(File.OpenRead(path)))
-                {
-                    reader.ReadBytes(80);
-                    int triangleCount = reader.ReadInt32();
-                    Console.WriteLine($"Loading {triangleCount} triangles from {Path.GetFileName(path)}");
-                    for (int i = 0; i < triangleCount; i++)
-                    {
-                        Vector3 fileNormal = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                        if (fileNormal.LengthSquared() < 1e-6f)
-                            fileNormal = Vector3.UnitY;
-                        Vector3 v0 = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                        Vector3 v1 = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                        Vector3 v2 = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                        Vector3 computedNormal = Vector3.Normalize(Vector3.Cross(v1 - v0, v2 - v0));
-                        if (Vector3.Dot(computedNormal, fileNormal) < 0)
+                            var vertices = new VertexRigged[vertexCountLocal];
+                            for (int i = 0; i < vertexCountLocal; i++)
+                            {
+                                Int4 boneIndices;
+                                Vector4 boneWeights;
+                                if (hasJoints && hasWeights)
+                                {
+                                    boneIndices = new Int4(
+                                        jointsData[i][0],
+                                        jointsData[i][1],
+                                        jointsData[i][2],
+                                        jointsData[i][3]);
+                                    boneWeights = new Vector4(
+                                        weightsData[i][0],
+                                        weightsData[i][1],
+                                        weightsData[i][2],
+                                        weightsData[i][3]);
+                                }
+                                else
+                                {
+                                    boneIndices = new Int4(assignedBoneIndex, 0, 0, 0);
+                                    boneWeights = new Vector4(1f, 0f, 0f, 0f);
+                                }
+
+                                vertices[i] = new VertexRigged(
+                                    positions[i],
+                                    normals[i],
+                                    new Vector3(1, 0, 0),
+                                    boneIndices,
+                                    boneWeights);
+                            }
+                            Console.WriteLine($" Created {vertexCountLocal} vertices and {primIndices.Length} indices.");
+
+                            ResourceFactory factory = _graphicsDevice.ResourceFactory;
+                            DeviceBuffer vbNew = factory.CreateBuffer(new BufferDescription(
+                                (uint)(vertices.Length * VertexRigged.SizeInBytes),
+                                BufferUsage.VertexBuffer));
+                            _graphicsDevice.UpdateBuffer(vbNew, 0, vertices);
+
+                            DeviceBuffer ibNew = factory.CreateBuffer(new BufferDescription(
+                                (uint)(primIndices.Length * sizeof(ushort)),
+                                BufferUsage.IndexBuffer));
+                            _graphicsDevice.UpdateBuffer(ibNew, 0, primIndices);
+
+                            buffers = (vbNew, ibNew, vertices.Length, primIndices.Length);
+                            loadedPrimitives[key] = buffers;
+
+                            Vector3 center = ComputeCenter(vertices);
+                            models.Add(new Model
+                            {
+                                Name = node.Name + $"_prim{primIndex}",
+                                BoneIndex = assignedBoneIndex,
+                                VertexBuffer = vbNew,
+                                IndexBuffer = ibNew,
+                                VertexCount = vertices.Length,
+                                IndexCount = primIndices.Length,
+                                Transform = world, // Use the original world matrix.
+                                Center = center
+                            });
+                            Console.WriteLine($" Model '{node.Name}_prim{primIndex}' added with center: {center}");
+                        }
+                        else
                         {
-                            Vector3 temp = v1;
-                            v1 = v2;
-                            v2 = temp;
+                            models.Add(new Model
+                            {
+                                Name = node.Name + $"_prim{primIndex}_inst",
+                                BoneIndex = GetAssignedBoneIndex(node.Name),
+                                VertexBuffer = buffers.vb,
+                                IndexBuffer = buffers.ib,
+                                VertexCount = buffers.vertexCount,
+                                IndexCount = buffers.indexCount,
+                                Transform = world, // Use the original world matrix.
+                                Center = Vector3.Zero
+                            });
+                            Console.WriteLine($" Instance model '{node.Name}_prim{primIndex}_inst' added.");
                         }
-                        Vector3[] bary = new Vector3[] { new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 1f) };
-                        vertexList.Add(new VertexPositionNormalBary(v0, fileNormal, bary[0]));
-                        vertexList.Add(new VertexPositionNormalBary(v1, fileNormal, bary[1]));
-                        vertexList.Add(new VertexPositionNormalBary(v2, fileNormal, bary[2]));
-                        indexList.Add((ushort)(vertexList.Count - 3));
-                        indexList.Add((ushort)(vertexList.Count - 2));
-                        indexList.Add((ushort)(vertexList.Count - 1));
-                        reader.ReadBytes(2);
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error loading STL file '{path}': {ex.Message}");
-                return (new VertexPositionNormalBary[0], new ushort[0]);
-            }
-            Console.WriteLine($"Loaded {vertexList.Count} vertices from {Path.GetFileName(path)}");
-            return (vertexList.ToArray(), indexList.ToArray());
-        }
 
-        // Compute a model matrix for rigged vertices that centers and rotates the model right side up.
-        // In this version, we do NOT apply additional scaling so the model remains at its imported size.
-        private Matrix4x4 ComputeModelMatrix(VertexRigged[] vertices)
-        {
-            if (vertices.Length == 0)
-                return Matrix4x4.Identity;
-            Vector3 min = new Vector3(float.MaxValue);
-            Vector3 max = new Vector3(float.MinValue);
-            foreach (var v in vertices)
+            Console.WriteLine("Processing root nodes in DefaultScene:");
+            foreach (var root in modelRoot.LogicalNodes)
             {
-                min = Vector3.Min(min, v.Position);
-                max = Vector3.Max(max, v.Position);
+                ProcessNode(root);
             }
-            Vector3 center = (min + max) / 2;
-            float sizeX = max.X - min.X;
-            float sizeY = max.Y - min.Y;
-            float sizeZ = max.Z - min.Z;
-            float modelSize = MathF.Max(sizeX, MathF.Max(sizeY, sizeZ));
-            float desiredSize = 2.0f;
-            float scaleFactor = desiredSize / modelSize;
-            Console.WriteLine($"ComputeModelMatrix: Center={center}, ScaleFactor={scaleFactor}");
-            Matrix4x4 translation = Matrix4x4.CreateTranslation(-center);
-            Matrix4x4 scale = Matrix4x4.CreateScale(scaleFactor);
-            // Rotate -90° about the X-axis to turn the model right side up.
-            Matrix4x4 rotation = Matrix4x4.CreateRotationX(MathF.PI / 2);
-            return rotation * (translation * scale);
+            Console.WriteLine($"Total models loaded: {models.Count}");
+            return models;
         }
 
         private void CreateStagingTexture()
@@ -683,21 +849,160 @@ void main()
         }
 
         // Update the MVP and bone uniform buffers.
+        // Example method to update the bone transforms hierarchically.
+        public static Matrix4x4 CreateOrientation(Vector3 dir, Vector3 up, float rollAngle)
+        {
+            if (dir.Length() == 0f)
+                return Matrix4x4.Identity;
+
+            // Use 'dir' as the forward (y) direction.
+            Vector3 yAxis = Vector3.Normalize(dir);
+
+            // If up is nearly parallel to dir, pick an alternative.
+            if (MathF.Abs(Vector3.Dot(yAxis, up)) > 0.999f)
+                up = MathF.Abs(yAxis.Z) < 0.99f ? Vector3.UnitZ : Vector3.UnitX;
+
+            // Compute right and recalculated up.
+            Vector3 xAxis = Vector3.Normalize(Vector3.Cross(up, yAxis));
+            Vector3 zAxis = Vector3.Normalize(Vector3.Cross(xAxis, yAxis));
+
+            // Build a matrix whose rows are the new axes:
+            Matrix4x4 tm = new Matrix4x4(
+                xAxis.X, xAxis.Y, xAxis.Z, 0,
+                yAxis.X, yAxis.Y, yAxis.Z, 0,
+                zAxis.X, zAxis.Y, zAxis.Z, 0,
+                0, 0, 0, 1);
+
+            // Apply a roll (rotation about the forward/yAxis) if needed.
+            if (rollAngle != 0)
+                tm *= Matrix4x4.CreateFromAxisAngle(yAxis, rollAngle);
+
+            return tm;
+        }
+
+
+        private void UpdateBoneTransforms()
+        {
+            if (_cachedSkin == null)
+            {
+                Console.WriteLine("No cached skin data available. Cannot update bones.");
+                return;
+            }
+
+            int count = _cachedSkin.Joints.Count;
+            Matrix4x4[] boneTransforms = new Matrix4x4[count];
+
+            // Traverse each bone and apply hierarchical transformations
+            for (int i = 0; i < count; i++)
+            {
+                var joint = _cachedSkin.Joints[i];
+                Matrix4x4 parentTransform = joint.LogicalParent != null
+    ? _cachedSkin.Joints.FirstOrDefault(j => j.Name == joint.LogicalParent.DefaultScene.Name)?.WorldMatrix ?? Matrix4x4.Identity
+    : Matrix4x4.Identity;
+
+
+                // Compute final transform for the bone
+                boneTransforms[i] = GetBoneFinalTransform(i);
+
+            }
+
+            // Update bone uniform buffer
+            _graphicsDevice.UpdateBuffer(_boneBuffer, 0, boneTransforms);
+            Console.WriteLine("Bone uniform buffer updated.");
+        }
+        /// <summary>
+        /// Recursively computes the final transform for the bone at boneIndex.
+        /// </summary>
+        private Matrix4x4 GetBoneFinalTransform(int boneIndex)
+        {
+            var joint = _cachedSkin.Joints[boneIndex];
+            Matrix4x4 invBind = _cachedSkin.InverseBindMatrices[boneIndex];
+            Matrix4x4 final = joint.WorldMatrix * invBind;
+            // Get the current local transform (which includes rotation and pivot translation).
+            Matrix4x4 local = joint.LocalTransform.Matrix;
+
+            // Decompose the local transform into scale, rotation, and translation.
+            if (!Matrix4x4.Decompose(local, out Vector3 scale, out Quaternion origRotation, out Vector3 translation))
+            {
+                Console.WriteLine($"Decomposition failed for bone {joint.Name}");
+                return joint.WorldMatrix * invBind; // fallback
+            }
+            //Matrix4x4 newLocal = Matrix4x4.Identity;
+
+            // Decide if we need a correction based on the bone's name.
+            //Quaternion correction = joint.withro.Matrix;
+            string jointName = joint.Name.ToLower();
+            if (jointName.Contains("upperarmlowerbone"))
+            {
+                Quaternion newRotation = Quaternion.CreateFromYawPitchRoll(0.2f, 0f, 0f);
+
+                // Update the joint’s local transform so that its rotation is replaced but the translation (pivot) and scale remain the same.
+                joint.LocalTransform.WithRotation(newRotation);
+            }
+            else if (jointName.Contains("lowerarmlowerbone"))
+            {
+                float angleDegrees = 10f; // This variable is not used in the final rotation
+                float angleRadians = angleDegrees * (MathF.PI / 180f); // This variable is also not used
+                Quaternion additionalRotation = Quaternion.CreateFromYawPitchRoll(0.2f, 0f, 0f);
+
+                // Multiply the current rotation with the new rotation to add them.
+                joint.LocalTransform = joint.LocalTransform.WithRotation(joint.LocalTransform.Rotation * additionalRotation);
+                final = joint.LocalTransform.Matrix * joint.WorldMatrix * invBind;
+            }
+            else
+            {
+                final = joint.WorldMatrix * invBind;
+            }
+
+            // The pivot is the translation part of the local transform.
+            Vector3 pivot = translation;
+
+            //// Build the correction as a rotation about the pivot:
+            //Matrix4x4 correctionMatrix =
+            //    Matrix4x4.CreateTranslation(-pivot) *
+            //    Matrix4x4.CreateFromQuaternion(correction) *
+            //    Matrix4x4.CreateTranslation(pivot);
+
+            //// Apply the correction to the local transform:
+            //Matrix4x4 newLocal = correctionMatrix * local;
+
+            // Update the joint’s local transform so that the rotation is applied in place.
+            //joint.WithLocalRotation(correction);
+
+            // Finally, compute and return the final bone matrix.
+            
+            return final;
+        }
+        
+        
+        private Vector3 ComputeGroupPivot(List<Model> models)
+        {
+            //if (models == null || models.Count == 0)
+            //    return Vector3.Zero;
+
+            Vector3 groupMin = new Vector3(float.MaxValue);
+            Vector3 groupMax = new Vector3(float.MinValue);
+            foreach (var model in models)
+            {
+                // model.Center should be in world space; if not, transform it by model.Transform.
+                groupMin = Vector3.Min(groupMin, model.Center);
+                groupMax = Vector3.Max(groupMax, model.Center);
+            }
+            return groupMin + groupMax;
+        }
+
+
         private void UpdateMVP()
         {
             _cameraController.Update(0.016f, _input);
-            // For models, use their individual transform.
-            // For the grid, we use identity.
             Matrix4x4[] mvp = _cameraController.GetMVPMatrices(
                 _models.Count > 0 ? _models[0].Transform : Matrix4x4.Identity);
             _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, mvp);
 
-            // For now, set all bone matrices to identity.
-            Matrix4x4[] boneMatrices = new Matrix4x4[4];
-            for (int i = 0; i < 4; i++)
-                boneMatrices[i] = Matrix4x4.Identity;
-            _graphicsDevice.UpdateBuffer(_boneBuffer, 0, boneMatrices);
+            // Call our hierarchical bone update.
+            UpdateBoneTransforms();
         }
+
 
         public override void Render(Avalonia.Media.DrawingContext context)
         {
@@ -805,6 +1110,8 @@ void main()
             _graphicsDevice?.Dispose();
             _avaloniaBitmap = null;
         }
+
+
     }
 
     // -------------------------
