@@ -30,6 +30,7 @@ using Node = SharpGLTF.Schema2.Node;
 using ReactiveUI;
 using Tmds.DBus.Protocol;
 using System.Reflection.PortableExecutable;
+using System.Runtime.CompilerServices;
 
 namespace VeldridSTLViewer
 {
@@ -96,6 +97,8 @@ namespace VeldridSTLViewer
         public string Name { get; set; }
         public int BoneIndex { get; set; }  // 0 = base, 1 = upperarm, 2 = forearm, etc.
         public Vector3 Center { get; set; } // Computed center of the model's vertices (in world space, after applying Transform)
+        public bool IsSkinned { get; set; }
+
     }
 
     // -------------------------
@@ -117,6 +120,7 @@ namespace VeldridSTLViewer
 
         private Shader[] _modelShaders;
         private Pipeline _modelPipeline;
+
 
         private DeviceBuffer _mvpBuffer;
         private ResourceLayout _mvpLayout;
@@ -426,6 +430,8 @@ void main()
                 if (File.Exists(robotArmPath))
                 {
                     CacheModelData(robotArmPath);
+                    _cachedModelRoot = ModelRoot.Load(robotArmPath);
+
                     var loadedModels = LoadGLTFModelsFromModelRoot(_cachedModelRoot, 0);
                     foreach (var m in loadedModels)
                     {
@@ -601,14 +607,16 @@ void main()
             return boneIdx;
         }
 
-        // Updated LoadGLTFModelsFromModelRoot:
+        // Updated method to load models from a ModelRoot.
+        // This method traverses the entire scene graph (using LogicalChildren)
+        // and assigns each mesh the computed world transform.
         private List<Model> LoadGLTFModelsFromModelRoot(ModelRoot modelRoot, int defaultBoneIndex)
         {
             var models = new List<Model>();
+            // A cache to avoid creating duplicate GPU buffers for primitives reused in multiple nodes.
             var loadedPrimitives = new Dictionary<(SharpGLTF.Schema2.Mesh, int), (DeviceBuffer vb, DeviceBuffer ib, int vertexCount, int indexCount)>();
 
-            Console.WriteLine($"ModelRoot loaded. Scenes: {modelRoot.LogicalScenes.Count}, Skins: {modelRoot.LogicalSkins.Count()}");
-
+            // Helper to compute the center of a set of vertices.
             Vector3 ComputeCenter(VertexRigged[] vertices)
             {
                 Vector3 min = new Vector3(float.MaxValue);
@@ -621,34 +629,36 @@ void main()
                 return (min + max) / 2;
             }
 
+            // Process a node recursively.
             void ProcessNode(Node node)
             {
-                Console.WriteLine($"Processing Node: {node.Name}");
-                Console.WriteLine($" - WorldMatrix first row: {node.WorldMatrix.M11}, {node.WorldMatrix.M12}, {node.WorldMatrix.M13}, {node.WorldMatrix.M14}");
+                // Compute the node’s world transform using our helper.
+                Matrix4x4 worldTransform = ComputeNodeWorldMatrix(node);
 
-                Matrix4x4 world = node.WorldMatrix;
-
+                // If the node has a mesh, process each primitive.
                 if (node.Mesh != null)
                 {
-                    Console.WriteLine($" - Mesh present. Primitives count: {node.Mesh.Primitives.Count}");
                     int assignedBoneIndex = GetAssignedBoneIndex(node.Name);
-
                     for (int primIndex = 0; primIndex < node.Mesh.Primitives.Count; primIndex++)
                     {
                         var primitive = node.Mesh.Primitives[primIndex];
                         var key = (node.Mesh, primIndex);
                         if (!loadedPrimitives.TryGetValue(key, out var buffers))
                         {
+                            // Get POSITION and NORMAL arrays.
                             Vector3[] positions = primitive.VertexAccessors["POSITION"].AsVector3Array().ToArray();
-                            Vector3[] normals = primitive.VertexAccessors["NORMAL"].AsVector3Array().ToArray();
+                            Vector3[] normals = primitive.VertexAccessors.ContainsKey("NORMAL")
+                                ? primitive.VertexAccessors["NORMAL"].AsVector3Array().ToArray()
+                                : Enumerable.Repeat(Vector3.UnitY, positions.Length).ToArray();
 
+                            // Get index data (or generate sequential indices if not provided).
                             ushort[] primIndices = (primitive.IndexAccessor != null)
                                 ? primitive.IndexAccessor.AsIndicesArray().Select(x => (ushort)x).ToArray()
                                 : Enumerable.Range(0, positions.Length).Select(i => (ushort)i).ToArray();
 
+                            // Determine if skinning data is present.
                             bool hasJoints = primitive.VertexAccessors.ContainsKey("JOINTS_0");
                             bool hasWeights = primitive.VertexAccessors.ContainsKey("WEIGHTS_0");
-                            Console.WriteLine($" Primitive {primIndex}: HasJoints: {hasJoints}, HasWeights: {hasWeights}");
 
                             int vertexCountLocal = positions.Length;
                             int[][] jointsData = null;
@@ -665,6 +675,7 @@ void main()
                                     .ToArray();
                             }
 
+                            // Build vertices for this primitive.
                             var vertices = new VertexRigged[vertexCountLocal];
                             for (int i = 0; i < vertexCountLocal; i++)
                             {
@@ -685,6 +696,7 @@ void main()
                                 }
                                 else
                                 {
+                                    // For non-skinned meshes, use the assigned bone index.
                                     boneIndices = new Int4(assignedBoneIndex, 0, 0, 0);
                                     boneWeights = new Vector4(1f, 0f, 0f, 0f);
                                 }
@@ -692,12 +704,12 @@ void main()
                                 vertices[i] = new VertexRigged(
                                     positions[i],
                                     normals[i],
-                                    new Vector3(1, 0, 0),
+                                    new Vector3(1, 0, 0), // barycentrics (can be adjusted)
                                     boneIndices,
                                     boneWeights);
                             }
-                            Console.WriteLine($" Created {vertexCountLocal} vertices and {primIndices.Length} indices.");
 
+                            // Create GPU buffers.
                             ResourceFactory factory = _graphicsDevice.ResourceFactory;
                             DeviceBuffer vbNew = factory.CreateBuffer(new BufferDescription(
                                 (uint)(vertices.Length * VertexRigged.SizeInBytes),
@@ -721,13 +733,13 @@ void main()
                                 IndexBuffer = ibNew,
                                 VertexCount = vertices.Length,
                                 IndexCount = primIndices.Length,
-                                Transform = world, // Use the original world matrix.
+                                Transform = worldTransform, // Use the computed world transform.
                                 Center = center
                             });
-                            Console.WriteLine($" Model '{node.Name}_prim{primIndex}' added with center: {center}");
                         }
                         else
                         {
+                            // If already loaded, add an instance with the current node's transform.
                             models.Add(new Model
                             {
                                 Name = node.Name + $"_prim{primIndex}_inst",
@@ -736,24 +748,27 @@ void main()
                                 IndexBuffer = buffers.ib,
                                 VertexCount = buffers.vertexCount,
                                 IndexCount = buffers.indexCount,
-                                Transform = world, // Use the original world matrix.
+                                Transform = worldTransform,
                                 Center = Vector3.Zero
                             });
-                            Console.WriteLine($" Instance model '{node.Name}_prim{primIndex}_inst' added.");
                         }
                     }
                 }
+
+                // Process child nodes recursively.
+                foreach (var child in node.VisualChildren)
+                {
+                    ProcessNode(child);
+                }
             }
 
-            Console.WriteLine("Processing root nodes in DefaultScene:");
+            // Start processing from all root nodes in the model.
             foreach (var root in modelRoot.LogicalNodes)
             {
                 ProcessNode(root);
             }
-            Console.WriteLine($"Total models loaded: {models.Count}");
             return models;
         }
-
         private void CreateStagingTexture()
         {
             ResourceFactory factory = _graphicsDevice.ResourceFactory;
@@ -913,68 +928,53 @@ void main()
         /// <summary>
         /// Recursively computes the final transform for the bone at boneIndex.
         /// </summary>
+        private Matrix4x4 ComputeWorldTransform(Node node)
+        {
+            Matrix4x4 local = node.LocalTransform.Matrix;
+            if (node.LogicalParent == null || node.LogicalParent is SharpGLTF.Schema2.ModelRoot)
+                return local;
+            // Cast LogicalParent safely (assuming it’s a Node)
+            var parentNode = (Node)(object)node.LogicalParent;
+            return ComputeWorldTransform(parentNode) * local;
+        }
+
         private Matrix4x4 GetBoneFinalTransform(int boneIndex)
         {
             var joint = _cachedSkin.Joints[boneIndex];
-            Matrix4x4 invBind = _cachedSkin.InverseBindMatrices[boneIndex];
-            Matrix4x4 final = joint.WorldMatrix * invBind;
-            // Get the current local transform (which includes rotation and pivot translation).
-            Matrix4x4 local = joint.LocalTransform.Matrix;
+            // Extract translation from the joint's WorldMatrix.
+            Vector3 translation = new Vector3(joint.WorldMatrix.M41, joint.WorldMatrix.M42, joint.WorldMatrix.M43);
+            Matrix4x4 translationMatrix = Matrix4x4.CreateTranslation(translation);
 
-            // Decompose the local transform into scale, rotation, and translation.
-            if (!Matrix4x4.Decompose(local, out Vector3 scale, out Quaternion origRotation, out Vector3 translation))
-            {
-                Console.WriteLine($"Decomposition failed for bone {joint.Name}");
-                return joint.WorldMatrix * invBind; // fallback
-            }
-            //Matrix4x4 newLocal = Matrix4x4.Identity;
+            // Debug output to verify the translation.
+            Console.WriteLine($"Bone {joint.Name} translation: {translation.X:F2} {translation.Y:F2} {translation.Z:F2}");
 
-            // Decide if we need a correction based on the bone's name.
-            //Quaternion correction = joint.withro.Matrix;
-            string jointName = joint.Name.ToLower();
-            if (jointName.Contains("upperarmlowerbone"))
-            {
-                Quaternion newRotation = Quaternion.CreateFromYawPitchRoll(0.2f, 0f, 0f);
-
-                // Update the joint’s local transform so that its rotation is replaced but the translation (pivot) and scale remain the same.
-                joint.LocalTransform.WithRotation(newRotation);
-            }
-            else if (jointName.Contains("lowerarmlowerbone"))
-            {
-                float angleDegrees = 10f; // This variable is not used in the final rotation
-                float angleRadians = angleDegrees * (MathF.PI / 180f); // This variable is also not used
-                Quaternion additionalRotation = Quaternion.CreateFromYawPitchRoll(0.2f, 0f, 0f);
-
-                // Multiply the current rotation with the new rotation to add them.
-                joint.LocalTransform = joint.LocalTransform.WithRotation(joint.LocalTransform.Rotation * additionalRotation);
-                final = joint.LocalTransform.Matrix * joint.WorldMatrix * invBind;
-            }
+            return translationMatrix;
+        }
+        // Recursively computes the world transform for a given node.
+        private Matrix4x4 ComputeNodeWorldMatrix(Node node)
+        {
+            // If the node’s parent is the ModelRoot, then its world transform is its local transform.
+            if (node.LogicalParent is ModelRoot)
+                return node.LocalMatrix;
             else
             {
-                final = joint.WorldMatrix * invBind;
+                // Cast the LogicalParent to Node (it should be, if it’s part of the scene).
+                var parent = (Node)node.VisualParent;
+                return ComputeNodeWorldMatrix(parent) * node.LocalMatrix;
             }
-
-            // The pivot is the translation part of the local transform.
-            Vector3 pivot = translation;
-
-            //// Build the correction as a rotation about the pivot:
-            //Matrix4x4 correctionMatrix =
-            //    Matrix4x4.CreateTranslation(-pivot) *
-            //    Matrix4x4.CreateFromQuaternion(correction) *
-            //    Matrix4x4.CreateTranslation(pivot);
-
-            //// Apply the correction to the local transform:
-            //Matrix4x4 newLocal = correctionMatrix * local;
-
-            // Update the joint’s local transform so that the rotation is applied in place.
-            //joint.WithLocalRotation(correction);
-
-            // Finally, compute and return the final bone matrix.
-            
-            return final;
         }
-        
-        
+
+
+        // Helper method to format a Matrix4x4 as a string.
+        private string MatrixToString(Matrix4x4 m)
+        {
+            return $"{m.M11:F2} {m.M12:F2} {m.M13:F2} {m.M14:F2}\n" +
+                   $"{m.M21:F2} {m.M22:F2} {m.M23:F2} {m.M24:F2}\n" +
+                   $"{m.M31:F2} {m.M32:F2} {m.M33:F2} {m.M34:F2}\n" +
+                   $"{m.M41:F2} {m.M42:F2} {m.M43:F2} {m.M44:F2}";
+        }
+
+
         private Vector3 ComputeGroupPivot(List<Model> models)
         {
             //if (models == null || models.Count == 0)
@@ -1056,7 +1056,8 @@ void main()
             // --- Draw each model using its own transform ---
             foreach (var model in _models)
             {
-                Matrix4x4[] modelMVP = _cameraController.GetMVPMatrices(model.Transform);
+                Matrix4x4 modelMatrix = model.IsSkinned ? Matrix4x4.Identity : model.Transform;
+                Matrix4x4[] modelMVP = _cameraController.GetMVPMatrices(modelMatrix);
                 _graphicsDevice.UpdateBuffer(_mvpBuffer, 0, modelMVP);
                 _commandList.SetPipeline(_modelPipeline);
                 _commandList.SetGraphicsResourceSet(0, _mvpResourceSet);
@@ -1065,6 +1066,7 @@ void main()
                 _commandList.SetIndexBuffer(model.IndexBuffer, IndexFormat.UInt16);
                 _commandList.DrawIndexed((uint)model.IndexCount, 1, 0, 0, 0);
             }
+
 
             _commandList.CopyTexture(_offscreenColorTexture, _stagingTexture);
             _commandList.End();
