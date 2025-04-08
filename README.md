@@ -20,7 +20,7 @@ This error is common with Veldrid, even outside of this specific project. To res
 1.  **Clone the `veldrid-spirv` repository:**  Make sure to use the `--recurse-submodules` flag to fetch all necessary dependencies:
 
     ```bash
-    git clone --recurse-submodules [https://github.com/veldrid/veldrid-spirv.git](https://github.com/veldrid/veldrid-spirv.git)
+    git clone --recurse-submodules https://github.com/veldrid/veldrid-spirv.git
     ```
 
 2.  **Navigate to the cloned directory:**
